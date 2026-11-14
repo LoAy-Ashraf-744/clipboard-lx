@@ -13,7 +13,7 @@ pub enum Request {
     List { limit: u32, include_images: bool },
     Search { query: String, limit: u32, include_images: bool },
     Get { id: i64 },
-    Select { id: i64 },
+    Select { id: i64, auto_paste: bool },
     AddText { text: String },
     AddImage { png: Vec<u8> },
     Delete { id: i64 },
@@ -104,9 +104,10 @@ impl Request {
                 w.u8(4);
                 w.i64(*id);
             }
-            Request::Select { id } => {
+            Request::Select { id, auto_paste } => {
                 w.u8(5);
                 w.i64(*id);
+                w.bool(*auto_paste);
             }
             Request::AddText { text } => {
                 w.u8(6);
@@ -150,7 +151,10 @@ impl Request {
                 include_images: r.bool()?,
             },
             4 => Request::Get { id: r.i64()? },
-            5 => Request::Select { id: r.i64()? },
+            5 => Request::Select {
+                id: r.i64()?,
+                auto_paste: r.bool()?,
+            },
             6 => Request::AddText { text: r.str()? },
             7 => Request::AddImage { png: r.bytes()? },
             8 => Request::Delete { id: r.i64()? },

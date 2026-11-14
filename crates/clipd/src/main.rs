@@ -1,4 +1,5 @@
 mod clipboard;
+mod uinput;
 mod xfixes;
 
 use std::fs;
@@ -15,11 +16,13 @@ use clip_core::paths::{default_db_path, default_socket_path};
 use clip_core::store::ClipboardStore;
 
 use crate::clipboard::{capture_clipboard, hash_captured, write_clipboard, CapturedClipboard};
+use crate::uinput::VirtualKeyboard;
 
 struct AppState {
     store: Mutex<ClipboardStore>,
     paused: AtomicBool,
     recent_self_echoes: Mutex<Vec<(String, Instant)>>,
+    vkb: Arc<Mutex<Option<VirtualKeyboard>>>,
     db_path: PathBuf,
 }
 
@@ -92,7 +95,7 @@ impl AppState {
                     Err(e) => Response::Error(e),
                 }
             }
-            Request::Select { id } => {
+            Request::Select { id, auto_paste } => {
                 let entry_opt = {
                     let mut store = self.store.lock().unwrap();
                     match store.touch(id) {
@@ -105,7 +108,21 @@ impl AppState {
                 };
                 self.record_self_echo(entry.content_hash.clone());
                 match write_clipboard(&entry) {
-                    Ok(()) => Response::Entry(Some(entry)),
+                    Ok(()) => {
+                        if auto_paste {
+                            let vkb = Arc::clone(&self.vkb);
+                            std::thread::spawn(move || {
+                                std::thread::sleep(Duration::from_millis(130));
+                                let mut guard = vkb.lock().unwrap();
+                                if let Some(ref mut kb) = *guard {
+                                    if let Err(e) = kb.send_ctrl_v() {
+                                        eprintln!("clipd: auto-paste failed: {}", e);
+                                    }
+                                }
+                            });
+                        }
+                        Response::Entry(Some(entry))
+                    }
                     Err(e) => Response::Error(e),
                 }
             }
@@ -228,10 +245,22 @@ fn main() {
     });
     let _ = fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600));
 
+    let vkb = match VirtualKeyboard::open() {
+        Ok(kb) => {
+            eprintln!("clipd: /dev/uinput virtual keyboard ready");
+            Arc::new(Mutex::new(Some(kb)))
+        }
+        Err(e) => {
+            eprintln!("clipd: uinput unavailable ({}), auto-paste disabled", e);
+            Arc::new(Mutex::new(None))
+        }
+    };
+
     let state = Arc::new(AppState {
         store: Mutex::new(store),
         paused: AtomicBool::new(false),
         recent_self_echoes: Mutex::new(Vec::new()),
+        vkb,
         db_path,
     });
 

@@ -94,6 +94,7 @@ extern "C" {
     pub fn gtk_window_set_default_size(window: *mut c_void, width: c_int, height: c_int);
     pub fn gtk_window_present(window: *mut c_void);
     pub fn gtk_window_close(window: *mut c_void);
+    pub fn gtk_window_is_active(window: *mut c_void) -> c_int;
 
     pub fn gtk_widget_grab_focus(widget: *mut c_void) -> c_int;
     pub fn gtk_widget_add_css_class(widget: *mut c_void, css_class: *const c_char);
@@ -170,6 +171,15 @@ extern "C" {
     pub fn gtk_picture_set_content_fit(picture: *mut c_void, content_fit: c_int);
 
     pub fn gtk_button_new_from_icon_name(icon_name: *const c_char) -> *mut c_void;
+
+    pub fn gtk_revealer_new() -> *mut c_void;
+    pub fn gtk_revealer_set_child(revealer: *mut c_void, child: *mut c_void);
+    pub fn gtk_revealer_set_reveal_child(revealer: *mut c_void, reveal_child: c_int);
+    pub fn gtk_revealer_get_reveal_child(revealer: *mut c_void) -> c_int;
+
+    pub fn gtk_switch_new() -> *mut c_void;
+    pub fn gtk_switch_set_active(sw: *mut c_void, is_active: c_int);
+    pub fn gtk_switch_get_active(sw: *mut c_void) -> c_int;
 
     // ListBox
     pub fn gtk_list_box_new() -> *mut c_void;

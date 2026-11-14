@@ -31,3 +31,17 @@ pub fn default_db_path() -> PathBuf {
         .join(".local/share/clipboard-lx")
         .join("history.db")
 }
+
+pub fn default_settings_path() -> PathBuf {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        if !config_home.is_empty() {
+            return PathBuf::from(config_home)
+                .join("clipboard-lx")
+                .join("settings.conf");
+        }
+    }
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".config/clipboard-lx")
+        .join("settings.conf")
+}

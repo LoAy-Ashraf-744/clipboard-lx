@@ -10,6 +10,7 @@ use clip_core::ipc::{send_request, Request, Response};
 use clip_core::markdown::{is_markdown, markdown_to_pango_markup};
 use clip_core::model::{format_byte_size, format_relative_time, now_millis, ClipboardEntry, EntryKind};
 use clip_core::paths::default_socket_path;
+use clip_core::settings::Settings;
 
 use crate::gtk_ffi::*;
 
@@ -60,10 +61,21 @@ const APP_CSS: &str = "
     font-size: 0.82em;
     opacity: 0.65;
 }
+.clip-settings {
+    border-radius: 10px;
+    padding: 8px 12px;
+    background-color: @card_bg_color;
+    border: 1px solid alpha(@borders, 0.7);
+}
+.clip-settings-btn-active {
+    background-color: alpha(@accent_bg_color, 0.16);
+    color: @accent_color;
+}
 ";
 
 struct UiState {
     socket_path: PathBuf,
+    settings: Settings,
     window: *mut c_void,
     search_entry: *mut c_void,
     list_box: *mut c_void,
@@ -71,6 +83,10 @@ struct UiState {
     stack: *mut c_void,
     status_page: *mut c_void,
     count_label: *mut c_void,
+    settings_revealer: *mut c_void,
+    settings_btn: *mut c_void,
+    has_been_active: bool,
+    closing: bool,
     entries: Vec<ClipboardEntry>,
 }
 
@@ -140,12 +156,13 @@ unsafe fn build_row_widget(
     state_rc: &Rc<RefCell<UiState>>,
     entry: &ClipboardEntry,
     now_ms: i64,
+    render_markdown: bool,
 ) -> *mut c_void {
     let row = gtk_list_box_row_new();
     let hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     set_margins(hbox, 6, 6, 8, 6);
 
-    let is_md = entry.kind == EntryKind::Text && is_markdown(&entry.text);
+    let is_md = render_markdown && entry.kind == EntryKind::Text && is_markdown(&entry.text);
 
     // Leading visual: thumbnail for images, symbolic icon for text/markdown.
     match entry.kind {
@@ -346,8 +363,9 @@ unsafe fn refresh_list(state_rc: &Rc<RefCell<UiState>>) {
             }
 
             let now_ms = now_millis();
+            let render_md = s.settings.render_markdown;
             for entry in &entries {
-                let row = build_row_widget(state_rc, entry, now_ms);
+                let row = build_row_widget(state_rc, entry, now_ms, render_md);
                 gtk_list_box_append(s.list_box, row);
             }
             s.entries = entries;
@@ -378,16 +396,19 @@ unsafe fn refresh_list(state_rc: &Rc<RefCell<UiState>>) {
 }
 
 unsafe fn select_index(state_rc: &Rc<RefCell<UiState>>, index: i32) {
-    let (socket_path, id_opt, window) = {
-        let s = state_rc.borrow();
+    let (socket_path, id_opt, window, auto_paste) = {
+        let mut s = state_rc.borrow_mut();
         let id_opt = usize::try_from(index)
             .ok()
             .and_then(|i| s.entries.get(i))
             .map(|e| e.id);
-        (s.socket_path.clone(), id_opt, s.window)
+        if id_opt.is_some() {
+            s.closing = true;
+        }
+        (s.socket_path.clone(), id_opt, s.window, s.settings.auto_paste)
     };
     if let Some(id) = id_opt {
-        let _ = send_request(&socket_path, &Request::Select { id });
+        let _ = send_request(&socket_path, &Request::Select { id, auto_paste });
         if !window.is_null() {
             gtk_window_close(window);
         }
@@ -580,9 +601,137 @@ unsafe extern "C" fn on_key_pressed(
 unsafe extern "C" fn on_window_close_request(_win: *mut c_void, user_data: *mut c_void) -> c_int {
     let weak = &*(user_data as *const Weak<RefCell<UiState>>);
     if let Some(state_rc) = weak.upgrade() {
-        state_rc.borrow_mut().window = ptr::null_mut();
+        let mut s = state_rc.borrow_mut();
+        s.window = ptr::null_mut();
+        s.settings_revealer = ptr::null_mut();
+        s.settings_btn = ptr::null_mut();
+        s.has_been_active = false;
+        s.closing = false;
     }
     0
+}
+
+unsafe extern "C" fn on_is_active_changed(
+    win: *mut c_void,
+    _pspec: *mut c_void,
+    user_data: *mut c_void,
+) {
+    let weak = &*(user_data as *const Weak<RefCell<UiState>>);
+    let Some(state_rc) = weak.upgrade() else {
+        return;
+    };
+    let is_active = gtk_window_is_active(win) != 0;
+    let should_close = {
+        let mut s = state_rc.borrow_mut();
+        if is_active {
+            s.has_been_active = true;
+            false
+        } else if s.has_been_active && s.settings.close_on_focus_loss && !s.closing {
+            s.closing = true;
+            true
+        } else {
+            false
+        }
+    };
+    if should_close {
+        gtk_window_close(win);
+    }
+}
+
+unsafe extern "C" fn on_settings_toggled(_btn: *mut c_void, user_data: *mut c_void) {
+    let weak = &*(user_data as *const Weak<RefCell<UiState>>);
+    let Some(state_rc) = weak.upgrade() else {
+        return;
+    };
+    let revealer = state_rc.borrow().settings_revealer;
+    if !revealer.is_null() {
+        let revealed = gtk_revealer_get_reveal_child(revealer) != 0;
+        gtk_revealer_set_reveal_child(revealer, if revealed { 0 } else { 1 });
+    }
+}
+
+unsafe fn update_setting(
+    switch: *mut c_void,
+    user_data: *mut c_void,
+    refresh: bool,
+    apply: impl FnOnce(&mut Settings, bool),
+) {
+    let weak = &*(user_data as *const Weak<RefCell<UiState>>);
+    let Some(state_rc) = weak.upgrade() else {
+        return;
+    };
+    let active = gtk_switch_get_active(switch) != 0;
+    {
+        let mut s = state_rc.borrow_mut();
+        apply(&mut s.settings, active);
+        if let Err(e) = s.settings.save() {
+            eprintln!("clip-ui: failed to save settings: {e}");
+        }
+    }
+    if refresh {
+        refresh_list(&state_rc);
+    }
+}
+
+unsafe extern "C" fn on_auto_paste_toggled(
+    switch: *mut c_void,
+    _pspec: *mut c_void,
+    user_data: *mut c_void,
+) {
+    update_setting(switch, user_data, false, |cfg, val| cfg.auto_paste = val);
+}
+
+unsafe extern "C" fn on_focus_close_toggled(
+    switch: *mut c_void,
+    _pspec: *mut c_void,
+    user_data: *mut c_void,
+) {
+    update_setting(switch, user_data, false, |cfg, val| {
+        cfg.close_on_focus_loss = val;
+    });
+}
+
+unsafe extern "C" fn on_markdown_toggled(
+    switch: *mut c_void,
+    _pspec: *mut c_void,
+    user_data: *mut c_void,
+) {
+    update_setting(switch, user_data, true, |cfg, val| cfg.render_markdown = val);
+}
+
+unsafe fn append_settings_row(
+    parent: *mut c_void,
+    title: &std::ffi::CStr,
+    subtitle: &std::ffi::CStr,
+    initial: bool,
+    on_toggle: GCallback,
+    state_rc: &Rc<RefCell<UiState>>,
+) {
+    let row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_hexpand(row, 1);
+
+    let text_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(text_box, 1);
+    gtk_widget_set_valign(text_box, GTK_ALIGN_CENTER);
+
+    let title_lbl = gtk_label_new(title.as_ptr());
+    gtk_label_set_xalign(title_lbl, 0.0);
+    let sub_lbl = gtk_label_new(subtitle.as_ptr());
+    gtk_label_set_xalign(sub_lbl, 0.0);
+    gtk_widget_add_css_class(sub_lbl, c"dim-label".as_ptr());
+    gtk_widget_add_css_class(sub_lbl, c"caption".as_ptr());
+    gtk_box_append(text_box, title_lbl);
+    gtk_box_append(text_box, sub_lbl);
+
+    let switch = gtk_switch_new();
+    gtk_widget_set_valign(switch, GTK_ALIGN_CENTER);
+    gtk_widget_set_focusable(switch, 0);
+    gtk_switch_set_active(switch, if initial { 1 } else { 0 });
+    connect_boxed(switch, c"notify::active", on_toggle, Rc::downgrade(state_rc));
+
+    gtk_box_append(row, text_box);
+    gtk_box_append(row, switch);
+    gtk_box_append(parent, row);
 }
 
 unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
@@ -591,8 +740,17 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
     // Toggle off if already open (pressing Super+V twice hides it).
     let existing_win = state_rc.borrow().window;
     if !existing_win.is_null() {
+        state_rc.borrow_mut().closing = true;
         gtk_window_close(existing_win);
         return;
+    }
+
+    let settings = Settings::load();
+    {
+        let mut s = state_rc.borrow_mut();
+        s.settings = settings.clone();
+        s.has_been_active = false;
+        s.closing = false;
     }
 
     install_css();
@@ -621,7 +779,48 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
     gtk_widget_set_focusable(clear_btn, 0);
     adw_header_bar_pack_end(header, clear_btn);
 
+    let settings_btn = gtk_button_new_from_icon_name(c"emblem-system-symbolic".as_ptr());
+    gtk_widget_add_css_class(settings_btn, c"flat".as_ptr());
+    gtk_widget_set_tooltip_text(settings_btn, c"Clipboard options".as_ptr());
+    gtk_widget_set_focusable(settings_btn, 0);
+    adw_header_bar_pack_end(header, settings_btn);
+
     gtk_box_append(root_box, header);
+
+    // Collapsible inline options drawer (avoids popup focus-loss issues).
+    let settings_revealer = gtk_revealer_new();
+    let settings_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_add_css_class(settings_box, c"clip-settings".as_ptr());
+    set_margins(settings_box, 8, 8, 12, 12);
+
+    append_settings_row(
+        settings_box,
+        c"Auto-paste on select",
+        c"Paste into the active field and close",
+        settings.auto_paste,
+        on_auto_paste_toggled as GCallback,
+        state_rc,
+    );
+    append_settings_row(
+        settings_box,
+        c"Close on window switch",
+        c"Hide automatically when focus leaves",
+        settings.close_on_focus_loss,
+        on_focus_close_toggled as GCallback,
+        state_rc,
+    );
+    append_settings_row(
+        settings_box,
+        c"Format Markdown text",
+        c"Render Markdown styling in previews",
+        settings.render_markdown,
+        on_markdown_toggled as GCallback,
+        state_rc,
+    );
+
+    gtk_revealer_set_child(settings_revealer, settings_box);
+    gtk_revealer_set_reveal_child(settings_revealer, 0);
+    gtk_box_append(root_box, settings_revealer);
 
     // Search box directly below header.
     let search_entry = gtk_search_entry_new();
@@ -672,6 +871,8 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
         s.stack = stack;
         s.status_page = status_page;
         s.count_label = count_lbl;
+        s.settings_revealer = settings_revealer;
+        s.settings_btn = settings_btn;
     }
 
     connect_boxed(
@@ -690,6 +891,18 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
         clear_btn,
         c"clicked",
         on_clear_clicked as GCallback,
+        Rc::downgrade(state_rc),
+    );
+    connect_boxed(
+        settings_btn,
+        c"clicked",
+        on_settings_toggled as GCallback,
+        Rc::downgrade(state_rc),
+    );
+    connect_boxed(
+        window,
+        c"notify::is-active",
+        on_is_active_changed as GCallback,
         Rc::downgrade(state_rc),
     );
     connect_boxed(
@@ -724,7 +937,12 @@ fn main() {
         stack: ptr::null_mut(),
         status_page: ptr::null_mut(),
         count_label: ptr::null_mut(),
+        settings_revealer: ptr::null_mut(),
+        settings_btn: ptr::null_mut(),
         entries: Vec::new(),
+        settings: Settings::load(),
+        has_been_active: false,
+        closing: false,
     }));
 
     unsafe {

@@ -17,7 +17,7 @@ Commands:
   search <query>          Search clipboard history
   add-text <text|--stdin> Add a text entry
   add-image <path|--stdin> Add a PNG image entry
-  select <id>             Restore entry onto clipboard
+  select <id> [--paste]   Restore entry onto clipboard (optionally send Ctrl+V)
   delete <id>             Delete an entry
   pin <id>                Toggle pin status on an entry
   clear                   Delete all unpinned entries
@@ -124,7 +124,8 @@ fn main() {
         }
         "select" => {
             let id: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
-            Request::Select { id }
+            let auto_paste = args.iter().any(|a| a == "--paste");
+            Request::Select { id, auto_paste }
         }
         "delete" => {
             let id: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());

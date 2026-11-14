@@ -2,6 +2,7 @@ pub mod ipc;
 pub mod markdown;
 pub mod model;
 pub mod paths;
+pub mod settings;
 pub mod sqlite;
 pub mod store;
 
@@ -207,5 +208,28 @@ mod tests {
         // Truncating right inside an inline span still emits valid balanced closing tags.
         let truncated = markdown_to_pango_markup("**long bold text with <tag>&\"**", 1, 8);
         assert_eq!(truncated, "<b>long bol</b>…");
+    }
+
+    #[test]
+    fn settings_roundtrip_and_select_ipc() {
+        use crate::settings::Settings;
+
+        let dir = temp_db("settings");
+        let _ = std::fs::remove_file(&dir);
+        let s = Settings {
+            auto_paste: false,
+            close_on_focus_loss: true,
+            render_markdown: false,
+        };
+        s.save_to(&dir).unwrap();
+        let loaded = Settings::load_from(&dir);
+        assert_eq!(loaded, s);
+        let _ = std::fs::remove_file(&dir);
+
+        let req = Request::Select {
+            id: 99,
+            auto_paste: true,
+        };
+        assert_eq!(Request::decode(&req.encode()).unwrap(), req);
     }
 }
