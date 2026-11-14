@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/clip-core",
+    "crates/clipd",
+    "crates/clip-ui",
+    "crates/clip-ctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Loay Ashraf"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
