@@ -21,6 +21,7 @@ pub enum Request {
     Clear,
     SetPaused { paused: bool },
     Status,
+    Sync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +130,7 @@ impl Request {
                 w.bool(*paused);
             }
             Request::Status => w.u8(12),
+            Request::Sync => w.u8(13),
         }
         w.buf
     }
@@ -156,6 +158,7 @@ impl Request {
             10 => Request::Clear,
             11 => Request::SetPaused { paused: r.bool()? },
             12 => Request::Status,
+            13 => Request::Sync,
             other => return Err(format!("Unknown request tag {}", other)),
         };
         Ok(req)
