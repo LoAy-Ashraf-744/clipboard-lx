@@ -1,4 +1,5 @@
 pub mod ipc;
+pub mod markdown;
 pub mod model;
 pub mod paths;
 pub mod sqlite;
@@ -168,5 +169,43 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
         Ok(())
+    }
+
+    #[test]
+    fn markdown_detection_handles_markdown_and_plain_text() {
+        use crate::markdown::is_markdown;
+
+        assert!(is_markdown("# Project Title\nSome description"));
+        assert!(is_markdown("### Subheading"));
+        assert!(is_markdown("```rust\nfn main() {}\n```"));
+        assert!(is_markdown("- item one\n- item two"));
+        assert!(is_markdown("- [ ] todo task"));
+        assert!(is_markdown("> quoted note"));
+        assert!(is_markdown("Check [Rust docs](https://doc.rust-lang.org)"));
+        assert!(is_markdown("Use **bold** and `cargo test` here"));
+        assert!(is_markdown("This is *italic* and ~~old~~ text"));
+        assert!(is_markdown("| Col A | Col B |\n| --- | --- |\n| 1 | 2 |"));
+
+        // Plain non-markdown text must not trigger false positives.
+        assert!(!is_markdown("Hello world, just a normal sentence."));
+        assert!(!is_markdown("https://example.com/path?a=1&b=2"));
+        assert!(!is_markdown("my_snake_case __init__ 2 * 3 * 4"));
+        assert!(!is_markdown("- single dash note without other markdown"));
+    }
+
+    #[test]
+    fn markdown_pango_escapes_xml_and_balances_tags() {
+        use crate::markdown::markdown_to_pango_markup;
+
+        let md = "# Title <xml> & \"quotes\"\n- **Bold** & `let x = a < b && c > d;`\n> Quote with [link](https://example.com)";
+        let markup = markdown_to_pango_markup(md, 3, 240);
+
+        assert!(markup.contains("<b><big>Title &lt;xml&gt; &amp; &quot;quotes&quot;</big></b>"));
+        assert!(markup.contains("• <b>Bold</b> &amp; <tt>let x = a &lt; b &amp;&amp; c &gt; d;</tt>"));
+        assert!(markup.contains("│ <i>Quote with <u>link</u></i>"));
+
+        // Truncating right inside an inline span still emits valid balanced closing tags.
+        let truncated = markdown_to_pango_markup("**long bold text with <tag>&\"**", 1, 8);
+        assert_eq!(truncated, "<b>long bol</b>…");
     }
 }

@@ -7,7 +7,7 @@ A lightweight, native-feeling clipboard history manager for **Ubuntu 24.04 / GNO
 - **Native Ubuntu look & feel**: Built with GTK4 + libadwaita (`AdwApplicationWindow`, `GtkSearchEntry`, `GtkListBox`), automatically adapting to your Ubuntu Yaru/Adwaita light or dark theme.
 - **Zero-RAM idle UI**: `clip-ui` runs on demand when you press `Super+V` and exits immediately after selection or `Esc`.
 - **Tiny background daemon**: `clipd` uses event-driven XFixes selection monitoring (`XFixesSelectSelectionInput`) + GNOME Shell 46 extension forwarding (no polling), keeping idle RSS under ~5–10 MB.
-- **Text & Images**: Captures UTF-8 text and PNG images with dimensions, file sizes, deduplication, and inline thumbnail previews.
+- **Text, Markdown & Images**: Captures UTF-8 text (with automatic Markdown detection and native Pango formatted previews in the popup) and PNG images with dimensions, file sizes, deduplication, and inline thumbnail previews.
 - **Fast search**: Instant hybrid substring + fuzzy search over clipboard history stored in SQLite (with FTS5 indexing).
 - **Privacy aware**: Ignores password-manager concealed hints (`x-kde-passwordManagerHint`, `org.nspasteboard.ConcealedType`).
 - **Start on boot**: Installs a `systemd --user` service (`clipd.service`), XDG autostart fallback, and GNOME Shell 46 extension.

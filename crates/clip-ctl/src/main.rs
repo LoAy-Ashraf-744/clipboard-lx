@@ -37,6 +37,7 @@ fn print_entries(entries: &[clip_core::model::ClipboardEntry]) {
     for e in entries {
         let pin = if e.pinned { "📌" } else { "  " };
         let kind = match e.kind {
+            EntryKind::Text if clip_core::markdown::is_markdown(&e.text) => "MD  ",
             EntryKind::Text => "TEXT",
             EntryKind::Image => "IMG ",
         };

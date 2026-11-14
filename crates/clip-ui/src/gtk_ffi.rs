@@ -157,6 +157,7 @@ extern "C" {
 
     pub fn gtk_label_new(str_: *const c_char) -> *mut c_void;
     pub fn gtk_label_set_text(label: *mut c_void, str_: *const c_char);
+    pub fn gtk_label_set_markup(label: *mut c_void, str_: *const c_char);
     pub fn gtk_label_set_xalign(label: *mut c_void, xalign: f32);
     pub fn gtk_label_set_wrap(label: *mut c_void, wrap: c_int);
     pub fn gtk_label_set_lines(label: *mut c_void, lines: c_int);

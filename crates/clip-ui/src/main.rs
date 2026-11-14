@@ -7,6 +7,7 @@ use std::ptr;
 use std::rc::{Rc, Weak};
 
 use clip_core::ipc::{send_request, Request, Response};
+use clip_core::markdown::{is_markdown, markdown_to_pango_markup};
 use clip_core::model::{format_byte_size, format_relative_time, now_millis, ClipboardEntry, EntryKind};
 use clip_core::paths::default_socket_path;
 
@@ -144,7 +145,9 @@ unsafe fn build_row_widget(
     let hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
     set_margins(hbox, 6, 6, 8, 6);
 
-    // Leading visual: thumbnail for images, symbolic icon for text.
+    let is_md = entry.kind == EntryKind::Text && is_markdown(&entry.text);
+
+    // Leading visual: thumbnail for images, symbolic icon for text/markdown.
     match entry.kind {
         EntryKind::Image => {
             let mut thumb_widget = ptr::null_mut();
@@ -172,6 +175,8 @@ unsafe fn build_row_widget(
         EntryKind::Text => {
             let icon_name = if entry.pinned {
                 c"view-pin-symbolic".as_ptr()
+            } else if is_md {
+                c"text-x-generic-symbolic".as_ptr()
             } else {
                 c"edit-copy-symbolic".as_ptr()
             };
@@ -192,15 +197,25 @@ unsafe fn build_row_widget(
     gtk_widget_set_hexpand(vbox, 1);
     gtk_widget_set_valign(vbox, GTK_ALIGN_CENTER);
 
-    let title_str = match entry.kind {
-        EntryKind::Text => preview_text(&entry.text),
-        EntryKind::Image => entry.text.clone(),
+    let title_lbl = if is_md {
+        let markup = markdown_to_pango_markup(&entry.text, 3, 240);
+        let c_markup = cstr(&markup);
+        let lbl = gtk_label_new(ptr::null());
+        gtk_label_set_markup(lbl, c_markup.as_ptr());
+        gtk_label_set_lines(lbl, 3);
+        lbl
+    } else {
+        let title_str = match entry.kind {
+            EntryKind::Text => preview_text(&entry.text),
+            EntryKind::Image => entry.text.clone(),
+        };
+        let c_title = cstr(&title_str);
+        let lbl = gtk_label_new(c_title.as_ptr());
+        gtk_label_set_lines(lbl, 2);
+        lbl
     };
-    let c_title = cstr(&title_str);
-    let title_lbl = gtk_label_new(c_title.as_ptr());
     gtk_label_set_xalign(title_lbl, 0.0);
     gtk_label_set_wrap(title_lbl, 1);
-    gtk_label_set_lines(title_lbl, 2);
     gtk_label_set_ellipsize(title_lbl, PANGO_ELLIPSIZE_END);
     gtk_box_append(vbox, title_lbl);
 
@@ -208,10 +223,11 @@ unsafe fn build_row_widget(
     let meta = match entry.kind {
         EntryKind::Text => {
             let chars = entry.text.chars().count();
-            if entry.pinned {
-                format!("Pinned · {} · {} chars", rel, chars)
-            } else {
-                format!("{} · {} chars", rel, chars)
+            match (entry.pinned, is_md) {
+                (true, true) => format!("Pinned · Markdown · {} · {} chars", rel, chars),
+                (false, true) => format!("Markdown · {} · {} chars", rel, chars),
+                (true, false) => format!("Pinned · {} · {} chars", rel, chars),
+                (false, false) => format!("{} · {} chars", rel, chars),
             }
         }
         EntryKind::Image => {
