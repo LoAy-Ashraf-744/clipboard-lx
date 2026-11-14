@@ -19,23 +19,24 @@ use crate::clipboard::{capture_clipboard, hash_captured, write_clipboard, Captur
 struct AppState {
     store: Mutex<ClipboardStore>,
     paused: AtomicBool,
-    last_self_echo: Mutex<Option<(String, Instant)>>,
+    recent_self_echoes: Mutex<Vec<(String, Instant)>>,
     db_path: PathBuf,
 }
 
 impl AppState {
-    fn is_recent_self_echo(&self, hash: &str) -> bool {
-        let mut guard = self.last_self_echo.lock().unwrap();
-        if let Some((ref h, ts)) = *guard {
-            if ts.elapsed() < Duration::from_millis(1500) {
-                if h == hash {
-                    return true;
-                }
-            } else {
-                *guard = None;
-            }
+    fn record_self_echo(&self, hash: String) {
+        let mut guard = self.recent_self_echoes.lock().unwrap();
+        guard.retain(|(_, ts)| ts.elapsed() < Duration::from_millis(2000));
+        if guard.len() >= 8 {
+            guard.remove(0);
         }
-        false
+        guard.push((hash, Instant::now()));
+    }
+
+    fn is_recent_self_echo(&self, hash: &str) -> bool {
+        let mut guard = self.recent_self_echoes.lock().unwrap();
+        guard.retain(|(_, ts)| ts.elapsed() < Duration::from_millis(2000));
+        guard.iter().any(|(h, _)| h == hash)
     }
 
     fn ingest_current_clipboard(&self) {
@@ -102,10 +103,7 @@ impl AppState {
                 let Some(entry) = entry_opt else {
                     return Response::Error(format!("Entry {} not found", id));
                 };
-                {
-                    let mut last = self.last_self_echo.lock().unwrap();
-                    *last = Some((entry.content_hash.clone(), Instant::now()));
-                }
+                self.record_self_echo(entry.content_hash.clone());
                 match write_clipboard(&entry) {
                     Ok(()) => Response::Entry(Some(entry)),
                     Err(e) => Response::Error(e),
@@ -233,7 +231,7 @@ fn main() {
     let state = Arc::new(AppState {
         store: Mutex::new(store),
         paused: AtomicBool::new(false),
-        last_self_echo: Mutex::new(None),
+        recent_self_echoes: Mutex::new(Vec::new()),
         db_path,
     });
 

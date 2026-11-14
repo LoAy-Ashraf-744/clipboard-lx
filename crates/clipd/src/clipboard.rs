@@ -120,6 +120,17 @@ fn has_target(targets: &[String], expected: &str) -> bool {
         .any(|t| t.eq_ignore_ascii_case(expected))
 }
 
+fn is_valid_clipboard_text(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() || bytes.contains(&0) || bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    let s = String::from_utf8(bytes.to_vec()).ok()?;
+    if s.trim().is_empty() {
+        return None;
+    }
+    Some(s)
+}
+
 fn read_text(targets: &[String]) -> Option<String> {
     let timeout = Duration::from_millis(1500);
     if has_wayland() {
@@ -137,10 +148,8 @@ fn read_text(targets: &[String]) -> Option<String> {
             None => vec!["--no-newline"],
         };
         if let Ok(bytes) = run_capture_cmd("wl-paste", &args, timeout) {
-            if let Ok(s) = String::from_utf8(bytes) {
-                if !s.trim().is_empty() {
-                    return Some(s);
-                }
+            if let Some(s) = is_valid_clipboard_text(&bytes) {
+                return Some(s);
             }
         }
     }
@@ -151,8 +160,7 @@ fn read_text(targets: &[String]) -> Option<String> {
                 &["-o", "-selection", "clipboard", "-t", target],
                 timeout,
             ) {
-                let s = String::from_utf8_lossy(&bytes).into_owned();
-                if !s.trim().is_empty() {
+                if let Some(s) = is_valid_clipboard_text(&bytes) {
                     return Some(s);
                 }
             }
