@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Clipboard LX
+Comment=Fast GTK4 clipboard history manager
+Exec=/home/loay-ashraf/.local/bin/clip-ui
+Icon=edit-paste
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+StartupWMClass=org.clipboardlx.UI

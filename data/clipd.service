@@ -1,0 +1,14 @@
+[Unit]
+Description=clipboard-lx background clipboard daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/clipd
+Restart=always
+RestartSec=1
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+
+[Install]
+WantedBy=default.target graphical-session.target

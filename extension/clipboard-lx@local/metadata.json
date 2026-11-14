@@ -1,0 +1,7 @@
+{
+  "uuid": "clipboard-lx@local",
+  "name": "Clipboard LX",
+  "description": "Fast Wayland clipboard forwarding for clipboard-lx",
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1
+}

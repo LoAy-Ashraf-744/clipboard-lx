@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Clipboard LX Daemon
+Comment=Lightweight clipboard history daemon
+Exec=/home/loay-ashraf/.local/bin/clipd
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
