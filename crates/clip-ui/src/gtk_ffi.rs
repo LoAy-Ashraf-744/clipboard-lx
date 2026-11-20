@@ -22,13 +22,21 @@ pub const GTK_OVERFLOW_HIDDEN: c_int = 1;
 pub const PANGO_ELLIPSIZE_END: c_int = 3;
 pub const GTK_STYLE_PROVIDER_PRIORITY_APPLICATION: c_uint = 600;
 pub const G_APPLICATION_DEFAULT_FLAGS: c_int = 0;
+pub const G_APPLICATION_HANDLES_COMMAND_LINE: c_int = 8;
 
 pub const GDK_CONTROL_MASK: c_uint = 4;
+pub const GDK_ALT_MASK: c_uint = 8;
 pub const GDK_KEY_ESCAPE: c_uint = 65307;
 pub const GDK_KEY_RETURN: c_uint = 65293;
 pub const GDK_KEY_KP_ENTER: c_uint = 65421;
+pub const GDK_KEY_LEFT: c_uint = 65361;
 pub const GDK_KEY_UP: c_uint = 65362;
+pub const GDK_KEY_RIGHT: c_uint = 65363;
 pub const GDK_KEY_DOWN: c_uint = 65364;
+pub const GDK_KEY_TAB: c_uint = 65289;
+pub const GDK_KEY_ISO_LEFT_TAB: c_uint = 65056;
+pub const GDK_KEY_1: c_uint = 49;
+pub const GDK_KEY_2: c_uint = 50;
 pub const GDK_KEY_DELETE: c_uint = 65535;
 pub const GDK_KEY_P_LOWER: c_uint = 112;
 pub const GDK_KEY_P_UPPER: c_uint = 80;
@@ -66,6 +74,11 @@ extern "C" {
         argc: c_int,
         argv: *mut *mut c_char,
     ) -> c_int;
+    pub fn g_application_command_line_get_arguments(
+        cmdline: *mut c_void,
+        argc: *mut c_int,
+    ) -> *mut *mut c_char;
+    pub fn g_strfreev(str_array: *mut *mut c_char);
 
     // Libadwaita
     pub fn adw_application_new(application_id: *const c_char, flags: c_int) -> *mut c_void;
@@ -97,7 +110,9 @@ extern "C" {
     pub fn gtk_window_is_active(window: *mut c_void) -> c_int;
 
     pub fn gtk_widget_grab_focus(widget: *mut c_void) -> c_int;
+    pub fn gtk_widget_set_visible(widget: *mut c_void, visible: c_int);
     pub fn gtk_widget_add_css_class(widget: *mut c_void, css_class: *const c_char);
+    pub fn gtk_widget_remove_css_class(widget: *mut c_void, css_class: *const c_char);
     pub fn gtk_widget_set_margin_top(widget: *mut c_void, margin: c_int);
     pub fn gtk_widget_set_margin_bottom(widget: *mut c_void, margin: c_int);
     pub fn gtk_widget_set_margin_start(widget: *mut c_void, margin: c_int);
@@ -171,6 +186,30 @@ extern "C" {
     pub fn gtk_picture_set_content_fit(picture: *mut c_void, content_fit: c_int);
 
     pub fn gtk_button_new_from_icon_name(icon_name: *const c_char) -> *mut c_void;
+    pub fn gtk_button_new_with_label(label: *const c_char) -> *mut c_void;
+    pub fn gtk_button_set_child(button: *mut c_void, child: *mut c_void);
+
+    pub fn gtk_toggle_button_new() -> *mut c_void;
+    pub fn gtk_toggle_button_set_active(button: *mut c_void, is_active: c_int);
+    pub fn gtk_toggle_button_get_active(button: *mut c_void) -> c_int;
+    pub fn gtk_toggle_button_set_group(button: *mut c_void, group: *mut c_void);
+
+    // FlowBox
+    pub fn gtk_flow_box_new() -> *mut c_void;
+    pub fn gtk_flow_box_set_homogeneous(flow_box: *mut c_void, homogeneous: c_int);
+    pub fn gtk_flow_box_set_min_children_per_line(flow_box: *mut c_void, n_children: c_uint);
+    pub fn gtk_flow_box_set_max_children_per_line(flow_box: *mut c_void, n_children: c_uint);
+    pub fn gtk_flow_box_set_column_spacing(flow_box: *mut c_void, spacing: c_uint);
+    pub fn gtk_flow_box_set_row_spacing(flow_box: *mut c_void, spacing: c_uint);
+    pub fn gtk_flow_box_set_selection_mode(flow_box: *mut c_void, mode: c_int);
+    pub fn gtk_flow_box_set_activate_on_single_click(flow_box: *mut c_void, single: c_int);
+    pub fn gtk_flow_box_append(flow_box: *mut c_void, child: *mut c_void);
+    pub fn gtk_flow_box_remove_all(flow_box: *mut c_void);
+    pub fn gtk_flow_box_get_child_at_index(flow_box: *mut c_void, idx: c_int) -> *mut c_void;
+    pub fn gtk_flow_box_select_child(flow_box: *mut c_void, child: *mut c_void);
+    pub fn gtk_flow_box_child_new() -> *mut c_void;
+    pub fn gtk_flow_box_child_set_child(child: *mut c_void, widget: *mut c_void);
+    pub fn gtk_flow_box_child_get_index(child: *mut c_void) -> c_int;
 
     pub fn gtk_revealer_new() -> *mut c_void;
     pub fn gtk_revealer_set_child(revealer: *mut c_void, child: *mut c_void);

@@ -1,9 +1,13 @@
 use std::env;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use clip_core::model::{compute_content_hash, parse_png_dimensions, ClipboardEntry, EntryKind};
+use clip_core::paths::current_uid;
 use clip_core::store::MAX_IMAGE_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +31,69 @@ fn has_wayland() -> bool {
 
 fn has_x11() -> bool {
     env::var("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+fn newest_mutter_xauth(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with(".mutter-Xwaylandauth.") {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let replace = match &best {
+            None => true,
+            Some((best_time, _)) => mtime >= *best_time,
+        };
+        if replace {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// Resolves a valid `XAUTHORITY` cookie file for X11/XWayland connections.
+pub fn resolve_xauthority() -> Option<PathBuf> {
+    if let Some(p) = env::var_os("XAUTHORITY") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", current_uid())));
+    if let Some(mutter) = newest_mutter_xauth(&runtime_dir) {
+        return Some(mutter);
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        let fallback = PathBuf::from(home).join(".Xauthority");
+        if fallback.is_file() {
+            return Some(fallback);
+        }
+    }
+
+    None
+}
+
+fn apply_xclip_env(cmd: &mut Command, program: &str) {
+    if program == "xclip" {
+        if let Some(xauth) = resolve_xauthority() {
+            cmd.env("XAUTHORITY", xauth);
+        }
+    }
 }
 
 fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<Vec<u8>, String> {
@@ -65,11 +132,13 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Result<Vec<u8>, Str
 }
 
 fn run_capture_cmd(program: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
-    let child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    apply_xclip_env(&mut cmd, program);
+    let child = cmd
         .spawn()
         .map_err(|e| format!("spawn {}: {}", program, e))?;
     wait_with_timeout(child, timeout)
@@ -235,19 +304,30 @@ pub fn hash_captured(cap: &CapturedClipboard) -> String {
     }
 }
 
-fn pipe_to_background_setter(program: &str, args: &[&str], data: &[u8]) -> Result<(), String> {
-    let mut child = Command::new(program)
-        .args(args)
+fn pipe_to_background_setter(
+    program: &str,
+    args: &[&str],
+    data: &[u8],
+    timeout: Duration,
+) -> Result<(), String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    apply_xclip_env(&mut cmd, program);
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn {}: {}", program, e))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(data)
-            .map_err(|e| format!("write stdin {}: {}", program, e))?;
+        if let Err(e) = stdin.write_all(data) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("write stdin {}: {}", program, e));
+        }
     }
 
     let start = Instant::now();
@@ -261,61 +341,187 @@ fn pipe_to_background_setter(program: &str, args: &[&str], data: &[u8]) -> Resul
                 }
             }
             Ok(None) => {
-                if start.elapsed() >= Duration::from_millis(1200) {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
                     return Err(format!("{} did not fork within timeout", program));
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(e) => return Err(format!("wait {}: {}", program, e)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("wait {}: {}", program, e));
+            }
         }
     }
+}
+
+fn write_runtime_paste_file(bytes: &[u8]) -> Result<PathBuf, String> {
+    let path = env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .map(|d| d.join("clipboard-lx-paste.bin"))
+        .unwrap_or_else(|| PathBuf::from(format!("/tmp/clipboard-lx-paste-{}.bin", current_uid())));
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("open {}: {}", path.display(), e))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    file.flush()
+        .map_err(|e| format!("flush {}: {}", path.display(), e))?;
+    Ok(path)
+}
+
+fn try_shell_set_clipboard(method: &str, data: &[u8]) -> bool {
+    let Ok(path) = write_runtime_paste_file(data) else {
+        return false;
+    };
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'");
+    let gvariant_arg = format!("'{}'", escaped);
+
+    let ok = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--timeout",
+            "1",
+            "--dest",
+            "org.clipboardlx.Shell",
+            "--object-path",
+            "/org/clipboardlx/Shell",
+            "--method",
+            method,
+            &gvariant_arg,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let _ = fs::remove_file(&path);
+    ok
+}
+
+/// Asks the GNOME Shell extension to inject a paste shortcut via `Clutter.VirtualInputDevice`.
+pub fn try_shell_paste(delay_ms: u32) -> bool {
+    let delay_arg = delay_ms.to_string();
+    Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--timeout",
+            "2",
+            "--dest",
+            "org.clipboardlx.Shell",
+            "--object-path",
+            "/org/clipboardlx/Shell",
+            "--method",
+            "org.clipboardlx.Shell.Paste",
+            &delay_arg,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn write_via_backends(
+    shell_method: &str,
+    xclip_target: &str,
+    wl_mime: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    if try_shell_set_clipboard(shell_method, data) {
+        return Ok(());
+    }
+
+    let timeout = Duration::from_millis(2500);
+    if has_x11()
+        && pipe_to_background_setter(
+            "xclip",
+            &["-i", "-selection", "clipboard", "-t", xclip_target],
+            data,
+            timeout,
+        )
+        .is_ok()
+    {
+        return Ok(());
+    }
+    if has_wayland() {
+        return pipe_to_background_setter("wl-copy", &["--type", wl_mime], data, timeout);
+    }
+    Err("Neither GNOME Shell, X11 (xclip), nor Wayland (wl-copy) clipboard available".to_string())
+}
+
+/// Writes raw UTF-8 text onto the system clipboard without requiring a stored entry.
+pub fn write_text(text: &str) -> Result<(), String> {
+    write_via_backends(
+        "org.clipboardlx.Shell.SetTextFile",
+        "UTF8_STRING",
+        "text/plain",
+        text.as_bytes(),
+    )
 }
 
 /// Writes a stored entry (text or PNG image) onto the system clipboard.
 pub fn write_clipboard(entry: &ClipboardEntry) -> Result<(), String> {
     match entry.kind {
-        EntryKind::Text => {
-            let data = entry.text.as_bytes();
-            if has_x11() {
-                if pipe_to_background_setter(
-                    "xclip",
-                    &["-i", "-selection", "clipboard", "-t", "UTF8_STRING"],
-                    data,
-                )
-                .is_ok()
-                {
-                    return Ok(());
-                }
-            }
-            if has_wayland() {
-                return pipe_to_background_setter(
-                    "wl-copy",
-                    &["--type", "text/plain;charset=utf-8"],
-                    data,
-                );
-            }
-            Err("Neither X11 (xclip) nor Wayland (wl-copy) clipboard available".to_string())
-        }
+        EntryKind::Text => write_text(&entry.text),
         EntryKind::Image => {
             let png = entry
                 .image_png
                 .as_deref()
                 .ok_or_else(|| "Image entry missing PNG payload".to_string())?;
-            if has_x11() {
-                if pipe_to_background_setter(
-                    "xclip",
-                    &["-i", "-selection", "clipboard", "-t", "image/png"],
-                    png,
-                )
-                .is_ok()
-                {
-                    return Ok(());
-                }
-            }
-            if has_wayland() {
-                return pipe_to_background_setter("wl-copy", &["--type", "image/png"], png);
-            }
-            Err("Neither X11 (xclip) nor Wayland (wl-copy) clipboard available".to_string())
+            write_via_backends(
+                "org.clipboardlx.Shell.SetImageFile",
+                "image/png",
+                "image/png",
+                png,
+            )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newest_mutter_xauth;
+    use std::fs;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn newest_mutter_xauth_picks_latest_matching_file() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("clipd_xauth_test_{}", nanos));
+        fs::create_dir_all(&dir).unwrap();
+
+        let older = dir.join(".mutter-Xwaylandauth.AAAAAA");
+        let newer = dir.join(".mutter-Xwaylandauth.BBBBBB");
+        let unrelated = dir.join("other-file");
+
+        fs::write(&older, b"old").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&newer, b"new").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&unrelated, b"ignore").unwrap();
+
+        assert_eq!(newest_mutter_xauth(&dir), Some(newer));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

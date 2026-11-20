@@ -15,7 +15,9 @@ use clip_core::model::{compute_content_hash, EntryKind};
 use clip_core::paths::{default_db_path, default_socket_path};
 use clip_core::store::ClipboardStore;
 
-use crate::clipboard::{capture_clipboard, hash_captured, write_clipboard, CapturedClipboard};
+use crate::clipboard::{
+    capture_clipboard, hash_captured, write_clipboard, write_text, CapturedClipboard,
+};
 use crate::uinput::VirtualKeyboard;
 
 struct AppState {
@@ -40,6 +42,15 @@ impl AppState {
         let mut guard = self.recent_self_echoes.lock().unwrap();
         guard.retain(|(_, ts)| ts.elapsed() < Duration::from_millis(2000));
         guard.iter().any(|(h, _)| h == hash)
+    }
+
+    fn schedule_auto_paste(&self, auto_paste: bool, kind: EntryKind) {
+        if auto_paste {
+            let vkb = Arc::clone(&self.vkb);
+            std::thread::spawn(move || {
+                perform_auto_paste(&vkb, kind);
+            });
+        }
     }
 
     fn ingest_current_clipboard(&self) {
@@ -109,19 +120,10 @@ impl AppState {
                 self.record_self_echo(entry.content_hash.clone());
                 match write_clipboard(&entry) {
                     Ok(()) => {
-                        if auto_paste {
-                            let vkb = Arc::clone(&self.vkb);
-                            std::thread::spawn(move || {
-                                std::thread::sleep(Duration::from_millis(130));
-                                let mut guard = vkb.lock().unwrap();
-                                if let Some(ref mut kb) = *guard {
-                                    if let Err(e) = kb.send_ctrl_v() {
-                                        eprintln!("clipd: auto-paste failed: {}", e);
-                                    }
-                                }
-                            });
-                        }
-                        Response::Entry(Some(entry))
+                        self.schedule_auto_paste(auto_paste, entry.kind);
+                        let mut resp_entry = entry;
+                        resp_entry.image_png = None;
+                        Response::Entry(Some(resp_entry))
                     }
                     Err(e) => Response::Error(e),
                 }
@@ -192,6 +194,66 @@ impl AppState {
                 self.ingest_current_clipboard();
                 Response::Pong
             }
+            Request::PasteText { text, auto_paste } => {
+                self.record_self_echo(compute_content_hash(EntryKind::Text, text.as_bytes()));
+                match write_text(&text) {
+                    Ok(()) => {
+                        self.schedule_auto_paste(auto_paste, EntryKind::Text);
+                        Response::Bool(true)
+                    }
+                    Err(e) => Response::Error(e),
+                }
+            }
+        }
+    }
+}
+
+fn perform_auto_paste(vkb: &Mutex<Option<VirtualKeyboard>>, kind: EntryKind) {
+    let shell_delay_ms = if kind == EntryKind::Image { 160 } else { 120 };
+    if clipboard::try_shell_paste(shell_delay_ms) {
+        return;
+    }
+
+    let settle_ms = if kind == EntryKind::Image { 220 } else { 180 };
+    let start = Instant::now();
+    let mut guard = vkb.lock().unwrap();
+
+    if guard.is_none() {
+        match VirtualKeyboard::open() {
+            Ok(kb) => {
+                eprintln!("clipd: /dev/uinput virtual keyboard ready");
+                *guard = Some(kb);
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Err(e) => {
+                eprintln!("clipd: auto-paste skipped (uinput unavailable: {})", e);
+                return;
+            }
+        }
+    }
+
+    let settle = Duration::from_millis(settle_ms);
+    if start.elapsed() < settle {
+        std::thread::sleep(settle - start.elapsed());
+    }
+
+    if let Some(ref mut kb) = *guard {
+        if let Err(first_err) = kb.send_ctrl_v() {
+            eprintln!("clipd: auto-paste failed ({}), reopening uinput", first_err);
+            *guard = None;
+            match VirtualKeyboard::open() {
+                Ok(mut fresh) => {
+                    std::thread::sleep(Duration::from_millis(150));
+                    if let Err(retry_err) = fresh.send_ctrl_v() {
+                        eprintln!("clipd: auto-paste retry failed: {}", retry_err);
+                    } else {
+                        *guard = Some(fresh);
+                    }
+                }
+                Err(open_err) => {
+                    eprintln!("clipd: uinput reopen failed: {}", open_err);
+                }
+            }
         }
     }
 }
@@ -212,6 +274,16 @@ fn handle_client(mut stream: UnixStream, state: &AppState) {
 }
 
 fn main() {
+    let needs_xauth = std::env::var_os("XAUTHORITY")
+        .filter(|v| !v.is_empty())
+        .map(|p| !std::path::Path::new(&p).is_file())
+        .unwrap_or(true);
+    if needs_xauth {
+        if let Some(xauth) = clipboard::resolve_xauthority() {
+            std::env::set_var("XAUTHORITY", &xauth);
+        }
+    }
+
     let socket_path = default_socket_path();
     let db_path = default_db_path();
 

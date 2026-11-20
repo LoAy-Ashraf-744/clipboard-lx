@@ -32,16 +32,24 @@ pub fn default_db_path() -> PathBuf {
         .join("history.db")
 }
 
-pub fn default_settings_path() -> PathBuf {
+fn config_file_path(filename: &str) -> PathBuf {
     if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
         if !config_home.is_empty() {
             return PathBuf::from(config_home)
                 .join("clipboard-lx")
-                .join("settings.conf");
+                .join(filename);
         }
     }
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home)
         .join(".config/clipboard-lx")
-        .join("settings.conf")
+        .join(filename)
+}
+
+pub fn default_settings_path() -> PathBuf {
+    config_file_path("settings.conf")
+}
+
+pub fn default_recent_emojis_path() -> PathBuf {
+    config_file_path("recent_emojis.txt")
 }

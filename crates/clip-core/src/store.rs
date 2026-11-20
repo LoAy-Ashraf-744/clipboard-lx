@@ -2,9 +2,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use crate::markdown::is_markdown;
 use crate::model::{
     compute_content_hash, format_image_caption, now_millis, parse_png_dimensions, ClipboardEntry,
     EntryKind,
+};
+use crate::search::{
+    arabic_qwerty_to_latin, bounded_damerau_levenshtein, contains_arabic, max_typo_distance,
+    normalize_search_text,
 };
 use crate::sqlite::Connection;
 
@@ -17,7 +22,7 @@ struct EntryMeta {
     id: i64,
     kind: EntryKind,
     text: String,
-    text_lower: String,
+    text_norm: String,
     width: i32,
     height: i32,
     byte_size: usize,
@@ -156,7 +161,7 @@ impl ClipboardStore {
             id,
             kind: EntryKind::Text,
             text: text.to_string(),
-            text_lower: text.to_lowercase(),
+            text_norm: normalize_search_text(text),
             width: 0,
             height: 0,
             byte_size: text.len(),
@@ -214,7 +219,7 @@ impl ClipboardStore {
             id,
             kind: EntryKind::Image,
             text: caption.clone(),
-            text_lower: caption.to_lowercase(),
+            text_norm: normalize_search_text(&caption),
             width: width as i32,
             height: height as i32,
             byte_size: png_bytes.len(),
@@ -255,30 +260,45 @@ impl ClipboardStore {
             return self.list(limit, include_images);
         }
 
-        let query_lower = trimmed.to_lowercase();
-        let tokens: Vec<&str> = query_lower.split_whitespace().collect();
+        let mut parsed = parse_search_query(trimmed);
 
-        let mut scored: Vec<(i64, usize)> = Vec::new();
-        for (idx, item) in self.meta.iter().enumerate() {
-            if let Some(mut score) = score_entry(&query_lower, &tokens, &item.text_lower) {
-                if item.pinned {
-                    score += 800;
+        let selected_indices: Vec<usize> = if parsed.positives.is_empty() {
+            self.meta
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| matches_filters(&parsed, item))
+                .take(limit)
+                .map(|(idx, _)| idx)
+                .collect()
+        } else {
+            let mut scored = run_scored_search(&parsed, &self.meta);
+            if scored.is_empty() && contains_arabic(&parsed.joined_positive) {
+                if let Some(latin) = arabic_qwerty_to_latin(&parsed.joined_positive) {
+                    let mapped = normalize_search_text(&latin);
+                    parsed.positives = mapped
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect();
+                    parsed.joined_positive = parsed.positives.join(" ");
+                    if !parsed.positives.is_empty() {
+                        scored = run_scored_search(&parsed, &self.meta);
+                    }
                 }
-                scored.push((score, idx));
             }
-        }
 
-        scored.sort_unstable_by(|a, b| {
-            let ea = &self.meta[a.1];
-            let eb = &self.meta[b.1];
-            b.0.cmp(&a.0)
-                .then_with(|| eb.pinned.cmp(&ea.pinned))
-                .then_with(|| eb.updated_at.cmp(&ea.updated_at))
-                .then_with(|| eb.id.cmp(&ea.id))
-        });
+            scored.sort_unstable_by(|a, b| {
+                let ea = &self.meta[a.1];
+                let eb = &self.meta[b.1];
+                b.0.cmp(&a.0)
+                    .then_with(|| eb.pinned.cmp(&ea.pinned))
+                    .then_with(|| eb.updated_at.cmp(&ea.updated_at))
+                    .then_with(|| eb.id.cmp(&ea.id))
+            });
+            scored.into_iter().take(limit).map(|(_, idx)| idx).collect()
+        };
 
-        let mut out = Vec::with_capacity(limit.min(scored.len()));
-        for (_, idx) in scored.into_iter().take(limit) {
+        let mut out = Vec::with_capacity(selected_indices.len());
+        for idx in selected_indices {
             let item = &self.meta[idx];
             let blob = if include_images && item.kind == EntryKind::Image {
                 self.load_image_blob(item.id)?
@@ -430,12 +450,12 @@ impl ClipboardStore {
         )?;
         while stmt.step()? {
             let text = stmt.col_str(2);
-            let text_lower = text.to_lowercase();
+            let text_norm = normalize_search_text(&text);
             self.meta.push(EntryMeta {
                 id: stmt.col_i64(0),
                 kind: EntryKind::from_i32(stmt.col_i32(1)),
                 text,
-                text_lower,
+                text_norm,
                 width: stmt.col_i32(3),
                 height: stmt.col_i32(4),
                 byte_size: stmt.col_i64(5).max(0) as usize,
@@ -471,18 +491,185 @@ impl ClipboardStore {
     }
 }
 
-fn score_entry(query_lower: &str, tokens: &[&str], text_lower: &str) -> Option<i64> {
-    if let Some(s) = score_single(query_lower, text_lower) {
+struct ParsedQuery {
+    kind_filter: Option<EntryKind>,
+    only_markdown: bool,
+    only_pinned: bool,
+    only_url: bool,
+    excludes: Vec<String>,
+    positives: Vec<String>,
+    joined_positive: String,
+}
+
+fn push_optional_positive(positives: &mut Vec<String>, rest: &str) {
+    if !rest.is_empty() {
+        positives.push(rest.to_string());
+    }
+}
+
+fn parse_search_query(query: &str) -> ParsedQuery {
+    let mut parsed = ParsedQuery {
+        kind_filter: None,
+        only_markdown: false,
+        only_pinned: false,
+        only_url: false,
+        excludes: Vec::new(),
+        positives: Vec::new(),
+        joined_positive: String::new(),
+    };
+
+    for raw in query.split_whitespace() {
+        let norm = normalize_search_text(raw);
+        if norm.is_empty() {
+            continue;
+        }
+        if let Some(ex) = norm.strip_prefix('-') {
+            if !ex.is_empty() {
+                parsed.excludes.push(ex.to_string());
+            }
+            continue;
+        }
+        match norm.as_str() {
+            "type:image" | "type:img" => {
+                parsed.kind_filter = Some(EntryKind::Image);
+                continue;
+            }
+            "type:text" => {
+                parsed.kind_filter = Some(EntryKind::Text);
+                continue;
+            }
+            "type:md" | "type:markdown" => {
+                parsed.only_markdown = true;
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(rest) = norm
+            .strip_prefix("img:")
+            .or_else(|| norm.strip_prefix("image:"))
+        {
+            parsed.kind_filter = Some(EntryKind::Image);
+            push_optional_positive(&mut parsed.positives, rest);
+        } else if let Some(rest) = norm.strip_prefix("text:") {
+            parsed.kind_filter = Some(EntryKind::Text);
+            push_optional_positive(&mut parsed.positives, rest);
+        } else if let Some(rest) = norm
+            .strip_prefix("md:")
+            .or_else(|| norm.strip_prefix("markdown:"))
+        {
+            parsed.only_markdown = true;
+            push_optional_positive(&mut parsed.positives, rest);
+        } else if let Some(rest) = norm
+            .strip_prefix("pin:")
+            .or_else(|| norm.strip_prefix("pinned:"))
+        {
+            parsed.only_pinned = true;
+            push_optional_positive(&mut parsed.positives, rest);
+        } else if let Some(rest) = norm
+            .strip_prefix("url:")
+            .or_else(|| norm.strip_prefix("link:"))
+        {
+            parsed.only_url = true;
+            push_optional_positive(&mut parsed.positives, rest);
+        } else {
+            parsed.positives.push(norm);
+        }
+    }
+
+    parsed.joined_positive = parsed.positives.join(" ");
+    parsed
+}
+
+fn matches_filters(parsed: &ParsedQuery, item: &EntryMeta) -> bool {
+    if let Some(k) = parsed.kind_filter {
+        if item.kind != k {
+            return false;
+        }
+    }
+    if parsed.only_pinned && !item.pinned {
+        return false;
+    }
+    if parsed.only_markdown && !(item.kind == EntryKind::Text && is_markdown(&item.text)) {
+        return false;
+    }
+    if parsed.only_url
+        && !(item.text_norm.contains("http://") || item.text_norm.contains("https://"))
+    {
+        return false;
+    }
+    for ex in &parsed.excludes {
+        if item.text_norm.contains(ex.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn run_scored_search(parsed: &ParsedQuery, meta: &[EntryMeta]) -> Vec<(i64, usize)> {
+    let tok_refs: Vec<&str> = parsed.positives.iter().map(|s| s.as_str()).collect();
+    let mut scored = Vec::new();
+    for (idx, item) in meta.iter().enumerate() {
+        if !matches_filters(parsed, item) {
+            continue;
+        }
+        if let Some(mut score) = score_entry(&parsed.joined_positive, &tok_refs, &item.text_norm) {
+            if item.pinned {
+                score += 800;
+            }
+            score += item.use_count.min(20) * 15;
+            scored.push((score, idx));
+        }
+    }
+    scored
+}
+
+fn score_entry(query_norm: &str, tokens: &[&str], text_norm: &str) -> Option<i64> {
+    if tokens.len() == 1 {
+        return score_single(tokens[0], text_norm);
+    }
+    if let Some(s) = score_single(query_norm, text_norm) {
         return Some(s);
     }
     if tokens.len() > 1 {
         let mut sum = 0i64;
         for tok in tokens {
-            sum += score_single(tok, text_lower)?;
+            sum += score_single(tok, text_norm)?;
         }
         return Some(sum / (tokens.len() as i64) + 500);
     }
     None
+}
+
+fn word_typo_score(needle: &str, haystack: &str) -> Option<i64> {
+    let n_len = needle.chars().count();
+    let max_dist = max_typo_distance(n_len);
+    if max_dist == 0 || n_len > 24 {
+        return None;
+    }
+    let mut best: Option<usize> = None;
+    for word in haystack
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .take(64)
+    {
+        let w_len = word.chars().count();
+        if w_len.abs_diff(n_len) > max_dist {
+            continue;
+        }
+        if let Some(d) = bounded_damerau_levenshtein(needle, word, max_dist) {
+            if best.map(|b| d < b).unwrap_or(true) {
+                best = Some(d);
+                if d == 1 {
+                    return Some(900);
+                }
+            }
+        }
+    }
+    match best {
+        Some(1) => Some(900),
+        Some(2) => Some(450),
+        _ => None,
+    }
 }
 
 fn score_single(needle: &str, haystack: &str) -> Option<i64> {
@@ -501,6 +688,10 @@ fn score_single(needle: &str, haystack: &str) -> Option<i64> {
             return Some(3_500 - (pos.min(500) as i64));
         }
         return Some(2_000 - (pos.min(500) as i64));
+    }
+
+    if let Some(typo_score) = word_typo_score(needle, haystack) {
+        return Some(typo_score);
     }
 
     // Fast fuzzy subsequence match (character-by-character in order).

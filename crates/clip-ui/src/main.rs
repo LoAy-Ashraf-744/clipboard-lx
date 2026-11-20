@@ -6,15 +6,22 @@ use std::path::PathBuf;
 use std::ptr;
 use std::rc::{Rc, Weak};
 
+use clip_core::emoji::{
+    emojis_for_category, load_recent_emojis, record_recent_emoji, search_emojis, EmojiCategory,
+    EmojiEntry,
+};
 use clip_core::ipc::{send_request, Request, Response};
 use clip_core::markdown::{is_markdown, markdown_to_pango_markup};
 use clip_core::model::{format_byte_size, format_relative_time, now_millis, ClipboardEntry, EntryKind};
 use clip_core::paths::default_socket_path;
+use clip_core::search::highlight_pango_preview;
 use clip_core::settings::Settings;
 
 use crate::gtk_ffi::*;
 
 const MAX_DISPLAY_ITEMS: u32 = 100;
+const EMOJI_GRID_COLS: i32 = 8;
+const MAX_EMOJI_SEARCH_RESULTS: usize = 160;
 
 const APP_CSS: &str = "
 .clip-search {
@@ -71,7 +78,56 @@ const APP_CSS: &str = "
     background-color: alpha(@accent_bg_color, 0.16);
     color: @accent_color;
 }
+.clip-tab-btn {
+    padding: 4px 10px;
+}
+.clip-emoji-cat-btn {
+    min-width: 34px;
+    min-height: 30px;
+    padding: 2px 4px;
+    border-radius: 8px;
+    font-size: 16px;
+}
+.clip-emoji-cat-active {
+    background-color: alpha(@accent_bg_color, 0.22);
+    color: @accent_color;
+}
+.clip-emoji-grid > flowboxchild {
+    border-radius: 8px;
+    padding: 4px;
+    transition: background-color 100ms ease;
+}
+.clip-emoji-grid > flowboxchild:hover {
+    background-color: alpha(@card_bg_color, 0.9);
+}
+.clip-emoji-grid > flowboxchild:selected {
+    background-color: alpha(@accent_bg_color, 0.22);
+    outline: 1px solid alpha(@accent_color, 0.55);
+}
+.clip-emoji-glyph {
+    font-size: 22px;
+}
+.clip-emoji-info {
+    font-size: 0.85em;
+    opacity: 0.72;
+}
 ";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveTab {
+    Clipboard,
+    Emojis,
+}
+
+enum PendingAction {
+    SelectEntry { id: i64, auto_paste: bool },
+    PasteEmoji { emoji: String, auto_paste: bool },
+}
+
+struct CategoryClickData {
+    state: Weak<RefCell<UiState>>,
+    category: EmojiCategory,
+}
 
 struct UiState {
     socket_path: PathBuf,
@@ -83,10 +139,28 @@ struct UiState {
     stack: *mut c_void,
     status_page: *mut c_void,
     count_label: *mut c_void,
+    clear_btn: *mut c_void,
     settings_revealer: *mut c_void,
     settings_btn: *mut c_void,
+    tab_clipboard_btn: *mut c_void,
+    tab_emoji_btn: *mut c_void,
+    main_stack: *mut c_void,
+    emoji_stack: *mut c_void,
+    emoji_scrolled: *mut c_void,
+    emoji_flow: *mut c_void,
+    emoji_empty: *mut c_void,
+    emoji_cat_btns: Vec<*mut c_void>,
+    emoji_info_label: *mut c_void,
+    footer_label: *mut c_void,
+    active_tab: ActiveTab,
+    active_emoji_cat: EmojiCategory,
+    recent_emojis: Vec<String>,
+    visible_emojis: Vec<&'static EmojiEntry>,
+    selected_emoji_idx: i32,
+    emoji_loaded: bool,
     has_been_active: bool,
     closing: bool,
+    pending_action: Option<PendingAction>,
     entries: Vec<ClipboardEntry>,
 }
 
@@ -157,6 +231,7 @@ unsafe fn build_row_widget(
     entry: &ClipboardEntry,
     now_ms: i64,
     render_markdown: bool,
+    query: &str,
 ) -> *mut c_void {
     let row = gtk_list_box_row_new();
     let hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
@@ -220,6 +295,13 @@ unsafe fn build_row_widget(
         let lbl = gtk_label_new(ptr::null());
         gtk_label_set_markup(lbl, c_markup.as_ptr());
         gtk_label_set_lines(lbl, 3);
+        lbl
+    } else if entry.kind == EntryKind::Text && !query.trim().is_empty() {
+        let markup = highlight_pango_preview(&preview_text(&entry.text), query);
+        let c_markup = cstr(&markup);
+        let lbl = gtk_label_new(ptr::null());
+        gtk_label_set_markup(lbl, c_markup.as_ptr());
+        gtk_label_set_lines(lbl, 2);
         lbl
     } else {
         let title_str = match entry.kind {
@@ -365,7 +447,7 @@ unsafe fn refresh_list(state_rc: &Rc<RefCell<UiState>>) {
             let now_ms = now_millis();
             let render_md = s.settings.render_markdown;
             for entry in &entries {
-                let row = build_row_widget(state_rc, entry, now_ms, render_md);
+                let row = build_row_widget(state_rc, entry, now_ms, render_md, &query);
                 gtk_list_box_append(s.list_box, row);
             }
             s.entries = entries;
@@ -395,23 +477,32 @@ unsafe fn refresh_list(state_rc: &Rc<RefCell<UiState>>) {
     }
 }
 
-unsafe fn select_index(state_rc: &Rc<RefCell<UiState>>, index: i32) {
-    let (socket_path, id_opt, window, auto_paste) = {
+unsafe fn trigger_close_with_action(state_rc: &Rc<RefCell<UiState>>, action: PendingAction) {
+    let window = {
         let mut s = state_rc.borrow_mut();
-        let id_opt = usize::try_from(index)
+        s.closing = true;
+        s.pending_action = Some(action);
+        s.window
+    };
+    if !window.is_null() {
+        gtk_widget_set_visible(window, 0);
+        gtk_window_close(window);
+    }
+}
+
+unsafe fn select_index(state_rc: &Rc<RefCell<UiState>>, index: i32) {
+    let action_opt = {
+        let s = state_rc.borrow();
+        usize::try_from(index)
             .ok()
             .and_then(|i| s.entries.get(i))
-            .map(|e| e.id);
-        if id_opt.is_some() {
-            s.closing = true;
-        }
-        (s.socket_path.clone(), id_opt, s.window, s.settings.auto_paste)
+            .map(|e| PendingAction::SelectEntry {
+                id: e.id,
+                auto_paste: s.settings.auto_paste,
+            })
     };
-    if let Some(id) = id_opt {
-        let _ = send_request(&socket_path, &Request::Select { id, auto_paste });
-        if !window.is_null() {
-            gtk_window_close(window);
-        }
+    if let Some(action) = action_opt {
+        trigger_close_with_action(state_rc, action);
     }
 }
 
@@ -429,6 +520,32 @@ unsafe fn current_selected_index(s: &UiState) -> Option<i32> {
     }
 }
 
+unsafe fn scroll_child_into_view(
+    scrolled: *mut c_void,
+    child: *mut c_void,
+    container: *mut c_void,
+    fallback_top: f64,
+    fallback_height: f64,
+) {
+    let vadj = gtk_scrolled_window_get_vadjustment(scrolled);
+    if vadj.is_null() {
+        return;
+    }
+    let page = gtk_adjustment_get_page_size(vadj);
+    let cur_scroll = gtk_adjustment_get_value(vadj);
+    let mut bounds = GrapheneRect::default();
+    let (top, bottom) = if gtk_widget_compute_bounds(child, container, &mut bounds) != 0 {
+        (bounds.y as f64, (bounds.y + bounds.height) as f64)
+    } else {
+        (fallback_top, fallback_top + fallback_height)
+    };
+    if top < cur_scroll {
+        gtk_adjustment_set_value(vadj, top);
+    } else if bottom > cur_scroll + page {
+        gtk_adjustment_set_value(vadj, bottom - page);
+    }
+}
+
 unsafe fn move_selection(s: &UiState, delta: i32) {
     let len = s.entries.len() as i32;
     if len <= 0 {
@@ -439,30 +556,293 @@ unsafe fn move_selection(s: &UiState, delta: i32) {
     let row = gtk_list_box_get_row_at_index(s.list_box, next);
     if !row.is_null() {
         gtk_list_box_select_row(s.list_box, row);
-        let vadj = gtk_scrolled_window_get_vadjustment(s.scrolled);
-        if !vadj.is_null() {
-            let page = gtk_adjustment_get_page_size(vadj);
-            let cur_scroll = gtk_adjustment_get_value(vadj);
-            let mut bounds = GrapheneRect::default();
-            let (top, bottom) = if gtk_widget_compute_bounds(row, s.list_box, &mut bounds) != 0 {
-                (bounds.y as f64, (bounds.y + bounds.height) as f64)
-            } else {
-                let t = (next as f64) * 66.0;
-                (t, t + 66.0)
-            };
-            if top < cur_scroll {
-                gtk_adjustment_set_value(vadj, top);
-            } else if bottom > cur_scroll + page {
-                gtk_adjustment_set_value(vadj, bottom - page);
-            }
+        scroll_child_into_view(s.scrolled, row, s.list_box, (next as f64) * 66.0, 66.0);
+    }
+}
+
+unsafe fn update_emoji_info_label(s: &UiState, is_search: bool) {
+    let prefix = if is_search {
+        "Search"
+    } else {
+        s.active_emoji_cat.label()
+    };
+    let selected = usize::try_from(s.selected_emoji_idx)
+        .ok()
+        .and_then(|i| s.visible_emojis.get(i));
+    let txt = match selected {
+        Some(e) => format!("{} · {} {}", prefix, e.glyph, e.name),
+        None => prefix.to_string(),
+    };
+    let c_txt = cstr(&txt);
+    gtk_label_set_text(s.emoji_info_label, c_txt.as_ptr());
+}
+
+unsafe fn update_emoji_category_buttons(s: &UiState, is_search: bool) {
+    for (idx, &btn) in s.emoji_cat_btns.iter().enumerate() {
+        if btn.is_null() {
+            continue;
+        }
+        gtk_widget_remove_css_class(btn, c"clip-emoji-cat-active".as_ptr());
+        if !is_search && EmojiCategory::ALL.get(idx) == Some(&s.active_emoji_cat) {
+            gtk_widget_add_css_class(btn, c"clip-emoji-cat-active".as_ptr());
         }
     }
+}
+
+unsafe fn refresh_emojis(state_rc: &Rc<RefCell<UiState>>) {
+    let need_load = !state_rc.borrow().emoji_loaded;
+    if need_load {
+        let loaded = load_recent_emojis();
+        let mut s = state_rc.borrow_mut();
+        s.recent_emojis = loaded;
+        s.emoji_loaded = true;
+    }
+
+    let query = {
+        let s = state_rc.borrow();
+        ptr_to_string(gtk_editable_get_text(s.search_entry))
+    };
+    let is_search = !query.trim().is_empty();
+
+    let mut s = state_rc.borrow_mut();
+    let items = if is_search {
+        search_emojis(&query, &s.recent_emojis, MAX_EMOJI_SEARCH_RESULTS)
+    } else {
+        emojis_for_category(s.active_emoji_cat, &s.recent_emojis)
+    };
+
+    let count_str = if is_search {
+        format!("{} matches", items.len())
+    } else {
+        format!("{} emojis", items.len())
+    };
+    let c_count = cstr(&count_str);
+    gtk_label_set_text(s.count_label, c_count.as_ptr());
+
+    gtk_flow_box_remove_all(s.emoji_flow);
+    s.visible_emojis = items;
+    update_emoji_category_buttons(&s, is_search);
+
+    if s.visible_emojis.is_empty() {
+        s.selected_emoji_idx = 0;
+        gtk_stack_set_visible_child_name(s.emoji_stack, c"empty".as_ptr());
+        update_emoji_info_label(&s, is_search);
+        return;
+    }
+
+    for entry in &s.visible_emojis {
+        let child = gtk_flow_box_child_new();
+        gtk_widget_set_focusable(child, 0);
+        let c_tip = cstr(entry.name);
+        gtk_widget_set_tooltip_text(child, c_tip.as_ptr());
+
+        let c_glyph = cstr(entry.glyph);
+        let lbl = gtk_label_new(c_glyph.as_ptr());
+        gtk_widget_add_css_class(lbl, c"clip-emoji-glyph".as_ptr());
+        gtk_flow_box_child_set_child(child, lbl);
+        gtk_flow_box_append(s.emoji_flow, child);
+    }
+
+    gtk_stack_set_visible_child_name(s.emoji_stack, c"grid".as_ptr());
+    s.selected_emoji_idx = 0;
+    let first = gtk_flow_box_get_child_at_index(s.emoji_flow, 0);
+    if !first.is_null() {
+        gtk_flow_box_select_child(s.emoji_flow, first);
+    }
+    let vadj = gtk_scrolled_window_get_vadjustment(s.emoji_scrolled);
+    if !vadj.is_null() {
+        gtk_adjustment_set_value(vadj, 0.0);
+    }
+    update_emoji_info_label(&s, is_search);
+}
+
+unsafe fn move_emoji_selection(s: &mut UiState, delta: i32) {
+    let len = s.visible_emojis.len() as i32;
+    if len <= 0 {
+        return;
+    }
+    let cur = s.selected_emoji_idx.clamp(0, len - 1);
+    let next = (cur + delta).clamp(0, len - 1);
+    s.selected_emoji_idx = next;
+
+    let child = gtk_flow_box_get_child_at_index(s.emoji_flow, next);
+    if !child.is_null() {
+        gtk_flow_box_select_child(s.emoji_flow, child);
+        let row_est = ((next / EMOJI_GRID_COLS) as f64) * 44.0;
+        scroll_child_into_view(s.emoji_scrolled, child, s.emoji_flow, row_est, 44.0);
+    }
+    let is_search = !ptr_to_string(gtk_editable_get_text(s.search_entry))
+        .trim()
+        .is_empty();
+    update_emoji_info_label(s, is_search);
+}
+
+unsafe fn select_emoji_index(state_rc: &Rc<RefCell<UiState>>, index: i32) {
+    let glyph_and_paste = {
+        let s = state_rc.borrow();
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| s.visible_emojis.get(i))
+            .map(|e| (e.glyph.to_string(), s.settings.auto_paste))
+    };
+    if let Some((glyph, auto_paste)) = glyph_and_paste {
+        if let Err(err) = record_recent_emoji(&glyph) {
+            eprintln!("clip-ui: failed to save recent emoji: {}", err);
+        }
+        {
+            let mut s = state_rc.borrow_mut();
+            s.recent_emojis.retain(|item| item != &glyph);
+            s.recent_emojis.insert(0, glyph.clone());
+        }
+        trigger_close_with_action(
+            state_rc,
+            PendingAction::PasteEmoji {
+                emoji: glyph,
+                auto_paste,
+            },
+        );
+    }
+}
+
+unsafe fn apply_tab_chrome(
+    state_rc: &Rc<RefCell<UiState>>,
+    tab: ActiveTab,
+    clear_btn: *mut c_void,
+    search_entry: *mut c_void,
+    main_stack: *mut c_void,
+    footer_label: *mut c_void,
+    clip_btn: *mut c_void,
+    emoji_btn: *mut c_void,
+) {
+    match tab {
+        ActiveTab::Clipboard => {
+            if gtk_toggle_button_get_active(clip_btn) == 0 {
+                gtk_toggle_button_set_active(clip_btn, 1);
+            }
+            gtk_widget_set_visible(clear_btn, 1);
+            gtk_search_entry_set_placeholder_text(
+                search_entry,
+                c"Search text, images, or filters (img:, md:, pin:, url:)…".as_ptr(),
+            );
+            gtk_label_set_text(
+                footer_label,
+                c"↑↓ Navigate · Enter Paste · Ctrl+P Pin · Del Remove · Super+. Emojis · Esc Close"
+                    .as_ptr(),
+            );
+            gtk_stack_set_visible_child_name(main_stack, c"clipboard".as_ptr());
+            refresh_list(state_rc);
+        }
+        ActiveTab::Emojis => {
+            if gtk_toggle_button_get_active(emoji_btn) == 0 {
+                gtk_toggle_button_set_active(emoji_btn, 1);
+            }
+            gtk_widget_set_visible(clear_btn, 0);
+            gtk_search_entry_set_placeholder_text(
+                search_entry,
+                c"Search emojis (English, Arabic, or :), <3)…".as_ptr(),
+            );
+            gtk_label_set_text(
+                footer_label,
+                c"Arrows Navigate · Enter Paste · Super+V Clipboard · Esc Close".as_ptr(),
+            );
+            gtk_stack_set_visible_child_name(main_stack, c"emojis".as_ptr());
+            refresh_emojis(state_rc);
+        }
+    }
+    gtk_widget_grab_focus(search_entry);
+}
+
+unsafe fn switch_tab(state_rc: &Rc<RefCell<UiState>>, tab: ActiveTab) {
+    let (clear_btn, search_entry, main_stack, footer_label, clip_btn, emoji_btn) = {
+        let mut s = state_rc.borrow_mut();
+        if s.active_tab == tab {
+            return;
+        }
+        s.active_tab = tab;
+        (
+            s.clear_btn,
+            s.search_entry,
+            s.main_stack,
+            s.footer_label,
+            s.tab_clipboard_btn,
+            s.tab_emoji_btn,
+        )
+    };
+
+    apply_tab_chrome(
+        state_rc,
+        tab,
+        clear_btn,
+        search_entry,
+        main_stack,
+        footer_label,
+        clip_btn,
+        emoji_btn,
+    );
 }
 
 unsafe extern "C" fn on_search_changed(_entry: *mut c_void, user_data: *mut c_void) {
     let weak = &*(user_data as *const Weak<RefCell<UiState>>);
     if let Some(state_rc) = weak.upgrade() {
-        refresh_list(&state_rc);
+        let tab = state_rc.borrow().active_tab;
+        match tab {
+            ActiveTab::Clipboard => refresh_list(&state_rc),
+            ActiveTab::Emojis => refresh_emojis(&state_rc),
+        }
+    }
+}
+
+unsafe extern "C" fn on_tab_clipboard_toggled(btn: *mut c_void, user_data: *mut c_void) {
+    if gtk_toggle_button_get_active(btn) == 0 {
+        return;
+    }
+    let weak = &*(user_data as *const Weak<RefCell<UiState>>);
+    if let Some(state_rc) = weak.upgrade() {
+        switch_tab(&state_rc, ActiveTab::Clipboard);
+    }
+}
+
+unsafe extern "C" fn on_tab_emojis_toggled(btn: *mut c_void, user_data: *mut c_void) {
+    if gtk_toggle_button_get_active(btn) == 0 {
+        return;
+    }
+    let weak = &*(user_data as *const Weak<RefCell<UiState>>);
+    if let Some(state_rc) = weak.upgrade() {
+        switch_tab(&state_rc, ActiveTab::Emojis);
+    }
+}
+
+unsafe extern "C" fn on_emoji_category_clicked(_btn: *mut c_void, user_data: *mut c_void) {
+    let data = &*(user_data as *const CategoryClickData);
+    let Some(state_rc) = data.state.upgrade() else {
+        return;
+    };
+    let search_entry = {
+        let mut s = state_rc.borrow_mut();
+        s.active_emoji_cat = data.category;
+        s.search_entry
+    };
+    let current = ptr_to_string(gtk_editable_get_text(search_entry));
+    if current.is_empty() {
+        refresh_emojis(&state_rc);
+    } else {
+        // Clearing triggers on_search_changed -> refresh_emojis.
+        gtk_editable_set_text(search_entry, c"".as_ptr());
+    }
+    gtk_widget_grab_focus(search_entry);
+}
+
+unsafe extern "C" fn on_emoji_child_activated(
+    _flow_box: *mut c_void,
+    child: *mut c_void,
+    user_data: *mut c_void,
+) {
+    let weak = &*(user_data as *const Weak<RefCell<UiState>>);
+    if let Some(state_rc) = weak.upgrade() {
+        let idx = gtk_flow_box_child_get_index(child);
+        if idx >= 0 {
+            select_emoji_index(&state_rc, idx);
+        }
     }
 }
 
@@ -526,75 +906,129 @@ unsafe extern "C" fn on_key_pressed(
     };
 
     let ctrl = (state_mask & GDK_CONTROL_MASK) != 0;
+    let alt = (state_mask & GDK_ALT_MASK) != 0;
 
-    match keyval {
-        GDK_KEY_ESCAPE => {
-            let (search_entry, window) = {
-                let s = state_rc.borrow();
-                (s.search_entry, s.window)
-            };
-            let current = ptr_to_string(gtk_editable_get_text(search_entry));
-            if !current.is_empty() {
-                gtk_editable_set_text(search_entry, c"".as_ptr());
-                gtk_widget_grab_focus(search_entry);
-            } else if !window.is_null() {
-                gtk_window_close(window);
+    if (ctrl && (keyval == GDK_KEY_TAB || keyval == GDK_KEY_ISO_LEFT_TAB))
+        || (alt && (keyval == GDK_KEY_1 || keyval == GDK_KEY_2))
+    {
+        let target = if alt {
+            if keyval == GDK_KEY_1 {
+                ActiveTab::Clipboard
+            } else {
+                ActiveTab::Emojis
             }
-            1
-        }
-        GDK_KEY_DOWN => {
-            let s = state_rc.borrow();
-            move_selection(&s, 1);
-            1
-        }
-        GDK_KEY_UP => {
-            let s = state_rc.borrow();
-            move_selection(&s, -1);
-            1
-        }
-        GDK_KEY_RETURN | GDK_KEY_KP_ENTER => {
-            let idx = {
-                let s = state_rc.borrow();
-                current_selected_index(&s).unwrap_or(0)
-            };
-            select_index(&state_rc, idx);
-            1
-        }
-        GDK_KEY_P_LOWER | GDK_KEY_P_UPPER if ctrl => {
-            let (socket_path, id_opt) = {
-                let s = state_rc.borrow();
-                let id_opt = current_selected_index(&s)
-                    .and_then(|i| usize::try_from(i).ok())
-                    .and_then(|i| s.entries.get(i))
-                    .map(|e| e.id);
-                (s.socket_path.clone(), id_opt)
-            };
-            if let Some(id) = id_opt {
-                let _ = send_request(&socket_path, &Request::TogglePin { id });
-                refresh_list(&state_rc);
+        } else {
+            match state_rc.borrow().active_tab {
+                ActiveTab::Clipboard => ActiveTab::Emojis,
+                ActiveTab::Emojis => ActiveTab::Clipboard,
             }
-            1
+        };
+        switch_tab(&state_rc, target);
+        return 1;
+    }
+
+    if keyval == GDK_KEY_ESCAPE {
+        let (search_entry, window) = {
+            let s = state_rc.borrow();
+            (s.search_entry, s.window)
+        };
+        let current = ptr_to_string(gtk_editable_get_text(search_entry));
+        if !current.is_empty() {
+            gtk_editable_set_text(search_entry, c"".as_ptr());
+            gtk_widget_grab_focus(search_entry);
+        } else if !window.is_null() {
+            gtk_window_close(window);
         }
-        GDK_KEY_DELETE => {
-            let (socket_path, search_empty, id_opt) = {
+        return 1;
+    }
+
+    let active_tab = state_rc.borrow().active_tab;
+    if active_tab == ActiveTab::Emojis {
+        match keyval {
+            GDK_KEY_DOWN => {
+                let mut s = state_rc.borrow_mut();
+                move_emoji_selection(&mut s, EMOJI_GRID_COLS);
+                1
+            }
+            GDK_KEY_UP => {
+                let mut s = state_rc.borrow_mut();
+                move_emoji_selection(&mut s, -EMOJI_GRID_COLS);
+                1
+            }
+            GDK_KEY_RIGHT | GDK_KEY_LEFT => {
+                let mut s = state_rc.borrow_mut();
+                let search_empty = ptr_to_string(gtk_editable_get_text(s.search_entry)).is_empty();
+                if search_empty {
+                    let delta = if keyval == GDK_KEY_RIGHT { 1 } else { -1 };
+                    move_emoji_selection(&mut s, delta);
+                    1
+                } else {
+                    0
+                }
+            }
+            GDK_KEY_RETURN | GDK_KEY_KP_ENTER => {
+                let idx = state_rc.borrow().selected_emoji_idx;
+                select_emoji_index(&state_rc, idx);
+                1
+            }
+            _ => 0,
+        }
+    } else {
+        match keyval {
+            GDK_KEY_DOWN => {
                 let s = state_rc.borrow();
-                let txt = ptr_to_string(gtk_editable_get_text(s.search_entry));
-                let id_opt = current_selected_index(&s)
-                    .and_then(|i| usize::try_from(i).ok())
-                    .and_then(|i| s.entries.get(i))
-                    .map(|e| e.id);
-                (s.socket_path.clone(), txt.is_empty(), id_opt)
-            };
-            if ctrl || search_empty {
+                move_selection(&s, 1);
+                1
+            }
+            GDK_KEY_UP => {
+                let s = state_rc.borrow();
+                move_selection(&s, -1);
+                1
+            }
+            GDK_KEY_RETURN | GDK_KEY_KP_ENTER => {
+                let idx = {
+                    let s = state_rc.borrow();
+                    current_selected_index(&s).unwrap_or(0)
+                };
+                select_index(&state_rc, idx);
+                1
+            }
+            GDK_KEY_P_LOWER | GDK_KEY_P_UPPER if ctrl => {
+                let (socket_path, id_opt) = {
+                    let s = state_rc.borrow();
+                    let id_opt = current_selected_index(&s)
+                        .and_then(|i| usize::try_from(i).ok())
+                        .and_then(|i| s.entries.get(i))
+                        .map(|e| e.id);
+                    (s.socket_path.clone(), id_opt)
+                };
                 if let Some(id) = id_opt {
-                    let _ = send_request(&socket_path, &Request::Delete { id });
+                    let _ = send_request(&socket_path, &Request::TogglePin { id });
                     refresh_list(&state_rc);
                 }
-                return 1;
+                1
             }
-            0
+            GDK_KEY_DELETE => {
+                let (socket_path, search_empty, id_opt) = {
+                    let s = state_rc.borrow();
+                    let txt = ptr_to_string(gtk_editable_get_text(s.search_entry));
+                    let id_opt = current_selected_index(&s)
+                        .and_then(|i| usize::try_from(i).ok())
+                        .and_then(|i| s.entries.get(i))
+                        .map(|e| e.id);
+                    (s.socket_path.clone(), txt.is_empty(), id_opt)
+                };
+                if ctrl || search_empty {
+                    if let Some(id) = id_opt {
+                        let _ = send_request(&socket_path, &Request::Delete { id });
+                        refresh_list(&state_rc);
+                    }
+                    return 1;
+                }
+                0
+            }
+            _ => 0,
         }
-        _ => 0,
     }
 }
 
@@ -603,8 +1037,26 @@ unsafe extern "C" fn on_window_close_request(_win: *mut c_void, user_data: *mut 
     if let Some(state_rc) = weak.upgrade() {
         let mut s = state_rc.borrow_mut();
         s.window = ptr::null_mut();
+        s.search_entry = ptr::null_mut();
+        s.list_box = ptr::null_mut();
+        s.scrolled = ptr::null_mut();
+        s.stack = ptr::null_mut();
+        s.status_page = ptr::null_mut();
+        s.count_label = ptr::null_mut();
+        s.clear_btn = ptr::null_mut();
         s.settings_revealer = ptr::null_mut();
         s.settings_btn = ptr::null_mut();
+        s.tab_clipboard_btn = ptr::null_mut();
+        s.tab_emoji_btn = ptr::null_mut();
+        s.main_stack = ptr::null_mut();
+        s.emoji_stack = ptr::null_mut();
+        s.emoji_scrolled = ptr::null_mut();
+        s.emoji_flow = ptr::null_mut();
+        s.emoji_empty = ptr::null_mut();
+        s.emoji_info_label = ptr::null_mut();
+        s.footer_label = ptr::null_mut();
+        s.emoji_cat_btns.clear();
+        s.visible_emojis.clear();
         s.has_been_active = false;
         s.closing = false;
     }
@@ -734,23 +1186,40 @@ unsafe fn append_settings_row(
     gtk_box_append(parent, row);
 }
 
-unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
-    let state_rc = &*(user_data as *const Rc<RefCell<UiState>>);
-
-    // Toggle off if already open (pressing Super+V twice hides it).
-    let existing_win = state_rc.borrow().window;
-    if !existing_win.is_null() {
-        state_rc.borrow_mut().closing = true;
-        gtk_window_close(existing_win);
-        return;
+unsafe fn make_tab_button(
+    icon_name: &std::ffi::CStr,
+    label: &std::ffi::CStr,
+    group_with: Option<*mut c_void>,
+) -> *mut c_void {
+    let btn = gtk_toggle_button_new();
+    gtk_widget_set_focusable(btn, 0);
+    gtk_widget_add_css_class(btn, c"clip-tab-btn".as_ptr());
+    let content = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    let icon = gtk_image_new_from_icon_name(icon_name.as_ptr());
+    gtk_image_set_pixel_size(icon, 15);
+    let lbl = gtk_label_new(label.as_ptr());
+    gtk_box_append(content, icon);
+    gtk_box_append(content, lbl);
+    gtk_button_set_child(btn, content);
+    if let Some(leader) = group_with {
+        gtk_toggle_button_set_group(btn, leader);
     }
+    btn
+}
 
+unsafe fn open_window(
+    app: *mut c_void,
+    state_rc: &Rc<RefCell<UiState>>,
+    initial_tab: ActiveTab,
+) {
     let settings = Settings::load();
     {
         let mut s = state_rc.borrow_mut();
         s.settings = settings.clone();
+        s.active_tab = initial_tab;
         s.has_been_active = false;
         s.closing = false;
+        s.pending_action = None;
     }
 
     install_css();
@@ -761,11 +1230,23 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
 
     let root_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
 
-    // Native GNOME/Ubuntu HeaderBar.
+    // Native GNOME/Ubuntu HeaderBar with linked Clipboard / Emojis tab switcher.
     let header = adw_header_bar_new();
-    let title_lbl = gtk_label_new(c"Clipboard".as_ptr());
-    gtk_widget_add_css_class(title_lbl, c"title".as_ptr());
-    adw_header_bar_set_title_widget(header, title_lbl);
+    let tab_switcher = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(tab_switcher, c"linked".as_ptr());
+    let tab_clipboard_btn = make_tab_button(c"edit-paste-symbolic", c"Clipboard", None);
+    let tab_emoji_btn = make_tab_button(
+        c"face-smile-symbolic",
+        c"Emojis",
+        Some(tab_clipboard_btn),
+    );
+    match initial_tab {
+        ActiveTab::Clipboard => gtk_toggle_button_set_active(tab_clipboard_btn, 1),
+        ActiveTab::Emojis => gtk_toggle_button_set_active(tab_emoji_btn, 1),
+    }
+    gtk_box_append(tab_switcher, tab_clipboard_btn);
+    gtk_box_append(tab_switcher, tab_emoji_btn);
+    adw_header_bar_set_title_widget(header, tab_switcher);
 
     let count_lbl = gtk_label_new(c"".as_ptr());
     gtk_widget_add_css_class(count_lbl, c"clip-badge".as_ptr());
@@ -822,14 +1303,19 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
     gtk_revealer_set_reveal_child(settings_revealer, 0);
     gtk_box_append(root_box, settings_revealer);
 
-    // Search box directly below header.
+    // Search box shared across Clipboard and Emojis tabs.
     let search_entry = gtk_search_entry_new();
     gtk_search_entry_set_placeholder_text(search_entry, c"Search copied text or images…".as_ptr());
     gtk_widget_add_css_class(search_entry, c"clip-search".as_ptr());
     set_margins(search_entry, 8, 6, 12, 12);
     gtk_box_append(root_box, search_entry);
 
-    // Main stack: List vs Empty/Offline StatusPage.
+    // Outer stack switching between Clipboard and Emojis views.
+    let main_stack = gtk_stack_new();
+    gtk_widget_set_vexpand(main_stack, 1);
+    gtk_widget_set_hexpand(main_stack, 1);
+
+    // Clipboard page: List vs Empty/Offline StatusPage.
     let stack = gtk_stack_new();
     gtk_widget_set_vexpand(stack, 1);
     gtk_widget_set_hexpand(stack, 1);
@@ -849,13 +1335,82 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
 
     let status_page = adw_status_page_new();
     gtk_stack_add_named(stack, status_page, c"empty".as_ptr());
+    gtk_stack_add_named(main_stack, stack, c"clipboard".as_ptr());
 
-    gtk_box_append(root_box, stack);
+    // Emojis page: category strip + status line + FlowBox grid / empty state.
+    let emoji_page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    let cat_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    gtk_widget_set_hexpand(cat_bar, 1);
+    set_margins(cat_bar, 0, 4, 12, 12);
+
+    let mut emoji_cat_btns = Vec::with_capacity(EmojiCategory::ALL.len());
+    for &cat in &EmojiCategory::ALL {
+        let c_icon = cstr(cat.icon());
+        let btn = gtk_button_new_with_label(c_icon.as_ptr());
+        gtk_widget_add_css_class(btn, c"flat".as_ptr());
+        gtk_widget_add_css_class(btn, c"clip-emoji-cat-btn".as_ptr());
+        gtk_widget_set_hexpand(btn, 1);
+        gtk_widget_set_focusable(btn, 0);
+        let c_label = cstr(cat.label());
+        gtk_widget_set_tooltip_text(btn, c_label.as_ptr());
+        connect_boxed(
+            btn,
+            c"clicked",
+            on_emoji_category_clicked as GCallback,
+            CategoryClickData {
+                state: Rc::downgrade(state_rc),
+                category: cat,
+            },
+        );
+        gtk_box_append(cat_bar, btn);
+        emoji_cat_btns.push(btn);
+    }
+    gtk_box_append(emoji_page, cat_bar);
+
+    let emoji_info_label = gtk_label_new(c"".as_ptr());
+    gtk_label_set_xalign(emoji_info_label, 0.0);
+    gtk_widget_add_css_class(emoji_info_label, c"clip-emoji-info".as_ptr());
+    set_margins(emoji_info_label, 0, 4, 14, 14);
+    gtk_box_append(emoji_page, emoji_info_label);
+
+    let emoji_stack = gtk_stack_new();
+    gtk_widget_set_vexpand(emoji_stack, 1);
+    gtk_widget_set_hexpand(emoji_stack, 1);
+
+    let emoji_scrolled = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(emoji_scrolled, GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(emoji_scrolled, 1);
+
+    let emoji_flow = gtk_flow_box_new();
+    gtk_flow_box_set_homogeneous(emoji_flow, 1);
+    gtk_flow_box_set_min_children_per_line(emoji_flow, 7);
+    gtk_flow_box_set_max_children_per_line(emoji_flow, EMOJI_GRID_COLS as c_uint);
+    gtk_flow_box_set_column_spacing(emoji_flow, 4);
+    gtk_flow_box_set_row_spacing(emoji_flow, 4);
+    gtk_flow_box_set_selection_mode(emoji_flow, GTK_SELECTION_SINGLE);
+    gtk_flow_box_set_activate_on_single_click(emoji_flow, 1);
+    gtk_widget_add_css_class(emoji_flow, c"clip-emoji-grid".as_ptr());
+    set_margins(emoji_flow, 2, 8, 12, 12);
+
+    gtk_scrolled_window_set_child(emoji_scrolled, emoji_flow);
+    gtk_stack_add_named(emoji_stack, emoji_scrolled, c"grid".as_ptr());
+
+    let emoji_empty = adw_status_page_new();
+    adw_status_page_set_icon_name(emoji_empty, c"edit-find-symbolic".as_ptr());
+    adw_status_page_set_title(emoji_empty, c"No Emojis Found".as_ptr());
+    adw_status_page_set_description(
+        emoji_empty,
+        c"Try searching by name or keyword like smile, heart, or fire.".as_ptr(),
+    );
+    gtk_stack_add_named(emoji_stack, emoji_empty, c"empty".as_ptr());
+
+    gtk_box_append(emoji_page, emoji_stack);
+    gtk_stack_add_named(main_stack, emoji_page, c"emojis".as_ptr());
+
+    gtk_box_append(root_box, main_stack);
 
     // Keyboard hint footer.
-    let footer = gtk_label_new(
-        c"↑↓ Navigate · Enter Paste · Ctrl+P Pin · Del Remove · Esc Close".as_ptr(),
-    );
+    let footer = gtk_label_new(c"".as_ptr());
     gtk_widget_add_css_class(footer, c"clip-footer".as_ptr());
     set_margins(footer, 4, 8, 12, 12);
     gtk_box_append(root_box, footer);
@@ -871,9 +1426,39 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
         s.stack = stack;
         s.status_page = status_page;
         s.count_label = count_lbl;
+        s.clear_btn = clear_btn;
         s.settings_revealer = settings_revealer;
         s.settings_btn = settings_btn;
+        s.tab_clipboard_btn = tab_clipboard_btn;
+        s.tab_emoji_btn = tab_emoji_btn;
+        s.main_stack = main_stack;
+        s.emoji_stack = emoji_stack;
+        s.emoji_scrolled = emoji_scrolled;
+        s.emoji_flow = emoji_flow;
+        s.emoji_empty = emoji_empty;
+        s.emoji_cat_btns = emoji_cat_btns;
+        s.emoji_info_label = emoji_info_label;
+        s.footer_label = footer;
     }
+
+    connect_boxed(
+        tab_clipboard_btn,
+        c"toggled",
+        on_tab_clipboard_toggled as GCallback,
+        Rc::downgrade(state_rc),
+    );
+    connect_boxed(
+        tab_emoji_btn,
+        c"toggled",
+        on_tab_emojis_toggled as GCallback,
+        Rc::downgrade(state_rc),
+    );
+    connect_boxed(
+        emoji_flow,
+        c"child-activated",
+        on_emoji_child_activated as GCallback,
+        Rc::downgrade(state_rc),
+    );
 
     connect_boxed(
         search_entry,
@@ -922,9 +1507,70 @@ unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
     );
     gtk_widget_add_controller(window, key_ctrl);
 
-    refresh_list(state_rc);
+    apply_tab_chrome(
+        state_rc,
+        initial_tab,
+        clear_btn,
+        search_entry,
+        main_stack,
+        footer,
+        tab_clipboard_btn,
+        tab_emoji_btn,
+    );
     gtk_window_present(window);
     gtk_widget_grab_focus(search_entry);
+}
+
+unsafe extern "C" fn on_activate(app: *mut c_void, user_data: *mut c_void) {
+    let state_rc = &*(user_data as *const Rc<RefCell<UiState>>);
+    let existing_win = state_rc.borrow().window;
+    if !existing_win.is_null() {
+        state_rc.borrow_mut().closing = true;
+        gtk_window_close(existing_win);
+        return;
+    }
+    open_window(app, state_rc, ActiveTab::Clipboard);
+}
+
+unsafe extern "C" fn on_command_line(
+    app: *mut c_void,
+    cmdline: *mut c_void,
+    user_data: *mut c_void,
+) -> c_int {
+    let state_rc = &*(user_data as *const Rc<RefCell<UiState>>);
+    let mut argc: c_int = 0;
+    let argv = g_application_command_line_get_arguments(cmdline, &mut argc);
+    let mut target_tab = ActiveTab::Clipboard;
+    if !argv.is_null() {
+        for i in 1..(argc.max(0) as isize) {
+            let arg_ptr = *argv.offset(i);
+            if !arg_ptr.is_null() {
+                let arg = ptr_to_string(arg_ptr);
+                if matches!(arg.as_str(), "--emojis" | "-e" | "emojis") {
+                    target_tab = ActiveTab::Emojis;
+                    break;
+                }
+            }
+        }
+        g_strfreev(argv);
+    }
+
+    let (existing_win, current_tab) = {
+        let s = state_rc.borrow();
+        (s.window, s.active_tab)
+    };
+    if !existing_win.is_null() {
+        if current_tab == target_tab {
+            state_rc.borrow_mut().closing = true;
+            gtk_window_close(existing_win);
+        } else {
+            switch_tab(state_rc, target_tab);
+            gtk_window_present(existing_win);
+        }
+    } else {
+        open_window(app, state_rc, target_tab);
+    }
+    0
 }
 
 fn main() {
@@ -937,22 +1583,77 @@ fn main() {
         stack: ptr::null_mut(),
         status_page: ptr::null_mut(),
         count_label: ptr::null_mut(),
+        clear_btn: ptr::null_mut(),
         settings_revealer: ptr::null_mut(),
         settings_btn: ptr::null_mut(),
+        tab_clipboard_btn: ptr::null_mut(),
+        tab_emoji_btn: ptr::null_mut(),
+        main_stack: ptr::null_mut(),
+        emoji_stack: ptr::null_mut(),
+        emoji_scrolled: ptr::null_mut(),
+        emoji_flow: ptr::null_mut(),
+        emoji_empty: ptr::null_mut(),
+        emoji_cat_btns: Vec::new(),
+        emoji_info_label: ptr::null_mut(),
+        footer_label: ptr::null_mut(),
+        active_tab: ActiveTab::Clipboard,
+        active_emoji_cat: EmojiCategory::Recent,
+        recent_emojis: Vec::new(),
+        visible_emojis: Vec::new(),
+        selected_emoji_idx: 0,
+        emoji_loaded: false,
         entries: Vec::new(),
         settings: Settings::load(),
         has_been_active: false,
         closing: false,
+        pending_action: None,
     }));
+    let state_after = Rc::clone(&state);
+
+    let c_args: Vec<std::ffi::CString> = std::env::args().map(|a| cstr(&a)).collect();
+    let mut argv_ptrs: Vec<*mut std::ffi::c_char> = c_args
+        .iter()
+        .map(|cs| cs.as_ptr() as *mut std::ffi::c_char)
+        .collect();
+    let argc = argv_ptrs.len() as c_int;
+    argv_ptrs.push(ptr::null_mut());
 
     unsafe {
         let app = adw_application_new(
             c"org.clipboardlx.UI".as_ptr(),
-            G_APPLICATION_DEFAULT_FLAGS,
+            G_APPLICATION_HANDLES_COMMAND_LINE,
+        );
+        connect_boxed(
+            app,
+            c"command-line",
+            on_command_line as GCallback,
+            Rc::clone(&state),
         );
         connect_boxed(app, c"activate", on_activate as GCallback, state);
-        let status = g_application_run(app, 0, ptr::null_mut());
+        let status = g_application_run(app, argc, argv_ptrs.as_mut_ptr());
+        drop(c_args);
         g_object_unref(app);
+
+        let (socket_path, action) = {
+            let mut s = state_after.borrow_mut();
+            (s.socket_path.clone(), s.pending_action.take())
+        };
+        match action {
+            Some(PendingAction::SelectEntry { id, auto_paste }) => {
+                if let Err(e) = send_request(&socket_path, &Request::Select { id, auto_paste }) {
+                    eprintln!("clip-ui: select failed: {}", e);
+                }
+            }
+            Some(PendingAction::PasteEmoji { emoji, auto_paste }) => {
+                if let Err(e) =
+                    send_request(&socket_path, &Request::PasteText { text: emoji, auto_paste })
+                {
+                    eprintln!("clip-ui: emoji paste failed: {}", e);
+                }
+            }
+            None => {}
+        }
+
         std::process::exit(status);
     }
 }

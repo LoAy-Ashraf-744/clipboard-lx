@@ -1,7 +1,9 @@
+pub mod emoji;
 pub mod ipc;
 pub mod markdown;
 pub mod model;
 pub mod paths;
+pub mod search;
 pub mod settings;
 pub mod sqlite;
 pub mod store;
@@ -231,5 +233,162 @@ mod tests {
             auto_paste: true,
         };
         assert_eq!(Request::decode(&req.encode()).unwrap(), req);
+
+        let paste_req = Request::PasteText {
+            text: "🔥".to_string(),
+            auto_paste: true,
+        };
+        assert_eq!(Request::decode(&paste_req.encode()).unwrap(), paste_req);
+    }
+
+    #[test]
+    fn emoji_catalog_loads_all_categories_and_dedupes() {
+        use crate::emoji::{all_emojis, emojis_for_category, EmojiCategory};
+
+        let all = all_emojis();
+        assert!(all.len() > 1500);
+        for cat in EmojiCategory::ALL {
+            assert!(!emojis_for_category(cat, &[]).is_empty());
+        }
+        let heart_count = all.iter().filter(|e| e.glyph == "❤️").count();
+        assert_eq!(heart_count, 1);
+    }
+
+    #[test]
+    fn emoji_search_ranks_exact_keywords_and_recents() {
+        use crate::emoji::{
+            load_recent_emojis_from, record_recent_emoji_at, search_emojis,
+        };
+
+        let fire_hits = search_emojis("fire", &[], 20);
+        assert!(!fire_hits.is_empty());
+        assert_eq!(fire_hits[0].glyph, "🔥");
+
+        let lol_hits = search_emojis("lol", &[], 10);
+        assert!(lol_hits.iter().any(|e| e.glyph == "😂" || e.glyph == "🤣"));
+
+        let tears_hits = search_emojis("tears joy", &[], 10);
+        assert!(!tears_hits.is_empty());
+        assert_eq!(tears_hits[0].glyph, "😂");
+
+        let recents_file = temp_db("recent_emojis");
+        let _ = std::fs::remove_file(&recents_file);
+        record_recent_emoji_at(&recents_file, "🚀").unwrap();
+        record_recent_emoji_at(&recents_file, "❤️").unwrap();
+        let recents = load_recent_emojis_from(&recents_file);
+        assert_eq!(recents, vec!["❤️".to_string(), "🚀".to_string()]);
+
+        record_recent_emoji_at(&recents_file, "🚀").unwrap();
+        let recents2 = load_recent_emojis_from(&recents_file);
+        assert_eq!(recents2, vec!["🚀".to_string(), "❤️".to_string()]);
+        let _ = std::fs::remove_file(&recents_file);
+
+        let boosted = search_emojis("hot", &["🌶️".to_string()], 20);
+        assert!(!boosted.is_empty());
+    }
+
+    #[test]
+    fn search_utils_normalize_qwerty_typo_and_highlight() {
+        use crate::search::{
+            arabic_qwerty_to_latin, bounded_damerau_levenshtein, highlight_pango_preview,
+            normalize_search_text,
+        };
+
+        assert_eq!(normalize_search_text("قَلْبٌ جَمِيلَةٌ أَحْمَرُ"), "قلب جميله احمر");
+        assert_eq!(arabic_qwerty_to_latin("ؤخىفهىعث").as_deref(), Some("continue"));
+        assert_eq!(arabic_qwerty_to_latin("اثشقف").as_deref(), Some("heart"));
+        assert_eq!(arabic_qwerty_to_latin("بهقث").as_deref(), Some("fire"));
+        assert_eq!(arabic_qwerty_to_latin("hello"), None);
+
+        assert_eq!(bounded_damerau_levenshtein("frie", "fire", 1), Some(1));
+        assert_eq!(bounded_damerau_levenshtein("cliboard", "clipboard", 2), Some(1));
+        assert_eq!(bounded_damerau_levenshtein("abc", "wxyz", 1), None);
+
+        assert_eq!(
+            highlight_pango_preview("Hello <world> & Fire", "img: fire -skip"),
+            "Hello &lt;world&gt; &amp; <b><u>Fire</u></b>"
+        );
+    }
+
+    #[test]
+    fn emoji_search_bilingual_emoticons_typos_and_qwerty() {
+        use crate::emoji::search_emojis;
+
+        let ar_heart = search_emojis("قلب", &[], 20);
+        assert!(ar_heart.iter().any(|e| e.glyph == "❤️"));
+
+        let ar_fire = search_emojis("نار", &[], 20);
+        assert!(ar_fire.iter().any(|e| e.glyph == "🔥"));
+
+        let ar_laugh = search_emojis("ضحك", &[], 20);
+        assert!(ar_laugh.iter().any(|e| e.glyph == "😂" || e.glyph == "😀"));
+
+        let heart_em = search_emojis("<3", &[], 10);
+        assert_eq!(heart_em[0].glyph, "❤️");
+
+        let smile_em = search_emojis(":)", &[], 10);
+        assert!(smile_em.iter().any(|e| e.glyph == "😊" || e.glyph == "🙂"));
+
+        let plus_one = search_emojis("+1", &[], 10);
+        assert_eq!(plus_one[0].glyph, "👍");
+
+        let typo_fire = search_emojis("frie", &[], 10);
+        assert!(typo_fire.iter().any(|e| e.glyph == "🔥"));
+
+        let typo_heart = search_emojis("hart", &[], 10);
+        assert!(typo_heart.iter().any(|e| e.glyph == "❤️"));
+
+        let typo_rocket = search_emojis("roket", &[], 10);
+        assert!(typo_rocket.iter().any(|e| e.glyph == "🚀"));
+
+        let qwerty_heart = search_emojis("اثشقف", &[], 10);
+        assert!(qwerty_heart.iter().any(|e| e.glyph == "❤️"));
+
+        let qwerty_fire = search_emojis("بهقث", &[], 10);
+        assert!(qwerty_fire.iter().any(|e| e.glyph == "🔥"));
+    }
+
+    #[test]
+    fn clipboard_search_filters_and_typo_tolerance() {
+        let path = temp_db("smart_filters");
+        {
+            let mut store = ClipboardStore::open(&path).unwrap();
+            let pin_id = store.add_text("Faithful note").unwrap();
+            store.set_pinned(pin_id, true).unwrap();
+            let md_id = store.add_text("# Shopping List\n- apples").unwrap();
+            let url_id = store.add_text("https://example.com/docs <tag>").unwrap();
+            let clip_id = store.add_text("clipboard-lx rock solid").unwrap();
+            let img_id = store.add_image(&minimal_png(1920, 1080)).unwrap();
+
+            let imgs = store.search("img:", 10, false).unwrap();
+            assert_eq!(imgs.len(), 1);
+            assert_eq!(imgs[0].id, img_id);
+
+            let texts = store.search("text:", 10, false).unwrap();
+            assert_eq!(texts.len(), 4);
+            assert!(texts.iter().all(|e| e.kind == EntryKind::Text));
+
+            let mds = store.search("md:", 10, false).unwrap();
+            assert_eq!(mds.len(), 1);
+            assert_eq!(mds[0].id, md_id);
+
+            let pins = store.search("pin:", 10, false).unwrap();
+            assert_eq!(pins.len(), 1);
+            assert_eq!(pins[0].id, pin_id);
+
+            let urls = store.search("url:", 10, false).unwrap();
+            assert_eq!(urls.len(), 1);
+            assert_eq!(urls[0].id, url_id);
+
+            let excl = store.search("shopping -apples", 10, false).unwrap();
+            assert!(excl.is_empty());
+
+            let typo_clip = store.search("cliboard", 10, false).unwrap();
+            assert!(typo_clip.iter().any(|e| e.id == clip_id));
+
+            let typo_faith = store.search("fathful", 10, false).unwrap();
+            assert!(typo_faith.iter().any(|e| e.id == pin_id));
+        }
+        let _ = fs_cleanup(&path);
     }
 }

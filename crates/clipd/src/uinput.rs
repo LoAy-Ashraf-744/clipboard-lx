@@ -100,15 +100,15 @@ impl VirtualKeyboard {
     pub fn send_ctrl_v(&mut self) -> Result<(), String> {
         self.emit(EV_KEY, KEY_LEFTCTRL, 1)?;
         self.emit(EV_SYN, SYN_REPORT, 0)?;
-        std::thread::sleep(Duration::from_millis(12));
+        std::thread::sleep(Duration::from_millis(25));
 
         self.emit(EV_KEY, KEY_V, 1)?;
         self.emit(EV_SYN, SYN_REPORT, 0)?;
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(30));
 
         self.emit(EV_KEY, KEY_V, 0)?;
         self.emit(EV_SYN, SYN_REPORT, 0)?;
-        std::thread::sleep(Duration::from_millis(12));
+        std::thread::sleep(Duration::from_millis(25));
 
         self.emit(EV_KEY, KEY_LEFTCTRL, 0)?;
         self.emit(EV_SYN, SYN_REPORT, 0)?;

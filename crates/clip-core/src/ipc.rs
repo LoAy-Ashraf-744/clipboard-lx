@@ -22,6 +22,7 @@ pub enum Request {
     SetPaused { paused: bool },
     Status,
     Sync,
+    PasteText { text: String, auto_paste: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +133,11 @@ impl Request {
             }
             Request::Status => w.u8(12),
             Request::Sync => w.u8(13),
+            Request::PasteText { text, auto_paste } => {
+                w.u8(14);
+                w.str(text);
+                w.bool(*auto_paste);
+            }
         }
         w.buf
     }
@@ -163,6 +169,10 @@ impl Request {
             11 => Request::SetPaused { paused: r.bool()? },
             12 => Request::Status,
             13 => Request::Sync,
+            14 => Request::PasteText {
+                text: r.str()?,
+                auto_paste: r.bool()?,
+            },
             other => return Err(format!("Unknown request tag {}", other)),
         };
         Ok(req)

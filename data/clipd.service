@@ -1,6 +1,7 @@
 [Unit]
 Description=clipboard-lx background clipboard daemon
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -11,4 +12,4 @@ Environment=DISPLAY=:0
 Environment=WAYLAND_DISPLAY=wayland-0
 
 [Install]
-WantedBy=default.target graphical-session.target
+WantedBy=graphical-session.target

@@ -18,6 +18,7 @@ Commands:
   add-text <text|--stdin> Add a text entry
   add-image <path|--stdin> Add a PNG image entry
   select <id> [--paste]   Restore entry onto clipboard (optionally send Ctrl+V)
+  paste-text <text> [--paste] Write text/emoji to clipboard without adding to history
   delete <id>             Delete an entry
   pin <id>                Toggle pin status on an entry
   clear                   Delete all unpinned entries
@@ -140,6 +141,24 @@ fn main() {
         "resume" => Request::SetPaused { paused: false },
         "ping" => Request::Ping,
         "notify-change" | "sync" => Request::Sync,
+        "paste-text" => {
+            if args.len() < 2 {
+                usage();
+            }
+            let auto_paste = args[1..].iter().any(|a| a == "--paste");
+            let text_parts: Vec<&str> = args[1..]
+                .iter()
+                .filter(|a| *a != "--paste")
+                .map(|s| s.as_str())
+                .collect();
+            if text_parts.is_empty() {
+                usage();
+            }
+            Request::PasteText {
+                text: text_parts.join(" "),
+                auto_paste,
+            }
+        }
         _ => usage(),
     };
 

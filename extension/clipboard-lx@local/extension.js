@@ -1,3 +1,4 @@
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
@@ -11,10 +12,84 @@ const PRIVACY_TYPES = new Set([
     'x-clipd-ignore',
 ]);
 
+const TERMINAL_APPS = [
+    'gnome-terminal',
+    'kgx',
+    'org.gnome.console',
+    'alacritty',
+    'kitty',
+    'wezterm',
+    'tilix',
+    'terminator',
+    'konsole',
+    'foot',
+    'ghostty',
+    'ptyxis',
+    'xterm',
+    'urxvt',
+    'xfce4-terminal',
+    'mate-terminal',
+];
+
+const KEY_LEFTCTRL = 29;
+const KEY_LEFTSHIFT = 42;
+const KEY_V = 47;
+
+const DBUS_IFACE = `
+<node>
+  <interface name="org.clipboardlx.Shell">
+    <method name="SetTextFile">
+      <arg type="s" direction="in" name="path"/>
+    </method>
+    <method name="SetImageFile">
+      <arg type="s" direction="in" name="path"/>
+    </method>
+    <method name="Paste">
+      <arg type="u" direction="in" name="delayMs"/>
+    </method>
+  </interface>
+</node>
+`;
+
+function windowIdentifiers(win) {
+    if (!win)
+        return '';
+    const wmClass = win.get_wm_class?.() || '';
+    const gtkAppId = win.get_gtk_application_id?.() || '';
+    return `${wmClass} ${gtkAppId}`.toLowerCase();
+}
+
+function isClipUiWindow(win) {
+    const ids = windowIdentifiers(win);
+    return ids.includes('clipboardlx') || ids.includes('clip-ui');
+}
+
+function isTerminalWindow(win) {
+    const ids = windowIdentifiers(win);
+    return TERMINAL_APPS.some(term => ids.includes(term));
+}
+
 export default class ClipboardLxExtension extends Extension {
     enable() {
         this._clipCtl = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'clip-ctl']);
         this._selection = global.display.get_selection();
+        this._virtualKeyboard = null;
+        this._focusWatchId = 0;
+        this._focusFallbackTimerId = 0;
+        this._pasteTimerId = 0;
+        this._keyTimers = [];
+
+        this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_IFACE, this);
+        this._dbusImpl.export(Gio.DBus.session, '/org/clipboardlx/Shell');
+        this._busNameId = Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            'org.clipboardlx.Shell',
+            Gio.BusNameOwnerFlags.REPLACE | Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT,
+            null,
+            null,
+            null
+        );
+
         this._ownerChangedId = this._selection.connect('owner-changed', (_sel, selectionType, _source) => {
             if (selectionType !== Meta.SelectionType.SELECTION_CLIPBOARD)
                 return;
@@ -58,6 +133,123 @@ export default class ClipboardLxExtension extends Extension {
         });
     }
 
+    SetTextFile(path) {
+        const [ok, bytes] = Gio.File.new_for_path(path).load_contents(null);
+        if (!ok)
+            throw new Error(`Failed to read clipboard text file: ${path}`);
+        const text = new TextDecoder('utf-8').decode(bytes);
+        St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text);
+    }
+
+    SetImageFile(path) {
+        const [ok, bytes] = Gio.File.new_for_path(path).load_contents(null);
+        if (!ok)
+            throw new Error(`Failed to read clipboard image file: ${path}`);
+        St.Clipboard.get_default().set_content(
+            St.ClipboardType.CLIPBOARD,
+            'image/png',
+            new GLib.Bytes(bytes)
+        );
+    }
+
+    Paste(delayMs) {
+        this._clearPendingPaste();
+        const settle = Math.max(40, Math.min(delayMs || 120, 1000));
+        const focusWin = global.display.get_focus_window();
+
+        if (!isClipUiWindow(focusWin)) {
+            this._scheduleInject(settle);
+            return;
+        }
+
+        this._focusWatchId = global.display.connect('notify::focus-window', () => {
+            if (!isClipUiWindow(global.display.get_focus_window())) {
+                this._clearFocusWait();
+                this._scheduleInject(settle);
+            }
+        });
+        this._focusFallbackTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 600, () => {
+            this._focusFallbackTimerId = 0;
+            this._clearFocusWait();
+            this._scheduleInject(settle);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _scheduleInject(settleMs) {
+        if (this._pasteTimerId) {
+            GLib.source_remove(this._pasteTimerId);
+            this._pasteTimerId = 0;
+        }
+        this._pasteTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, settleMs, () => {
+            this._pasteTimerId = 0;
+            this._injectPaste();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _addKeyTimer(delayMs, fn) {
+        let id = 0;
+        id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
+            this._keyTimers = this._keyTimers.filter(t => t !== id);
+            fn();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._keyTimers.push(id);
+    }
+
+    _notifyKey(code, pressed) {
+        if (!this._virtualKeyboard)
+            return;
+        const state = pressed ? Clutter.KeyState.PRESSED : Clutter.KeyState.RELEASED;
+        this._virtualKeyboard.notify_key(GLib.get_monotonic_time(), code, state);
+    }
+
+    _injectPaste() {
+        if (!this._virtualKeyboard) {
+            const seat = Clutter.get_default_backend().get_default_seat();
+            this._virtualKeyboard = seat.create_virtual_device(
+                Clutter.InputDeviceType.KEYBOARD_DEVICE
+            );
+        }
+
+        const shiftPaste = isTerminalWindow(global.display.get_focus_window());
+        this._notifyKey(KEY_LEFTCTRL, true);
+        if (shiftPaste)
+            this._notifyKey(KEY_LEFTSHIFT, true);
+
+        this._addKeyTimer(25, () => this._notifyKey(KEY_V, true));
+        this._addKeyTimer(55, () => this._notifyKey(KEY_V, false));
+        this._addKeyTimer(80, () => {
+            if (shiftPaste)
+                this._notifyKey(KEY_LEFTSHIFT, false);
+            this._notifyKey(KEY_LEFTCTRL, false);
+        });
+    }
+
+    _clearFocusWait() {
+        if (this._focusWatchId) {
+            global.display.disconnect(this._focusWatchId);
+            this._focusWatchId = 0;
+        }
+        if (this._focusFallbackTimerId) {
+            GLib.source_remove(this._focusFallbackTimerId);
+            this._focusFallbackTimerId = 0;
+        }
+    }
+
+    _clearPendingPaste() {
+        this._clearFocusWait();
+        if (this._pasteTimerId) {
+            GLib.source_remove(this._pasteTimerId);
+            this._pasteTimerId = 0;
+        }
+        for (const id of this._keyTimers) {
+            GLib.source_remove(id);
+        }
+        this._keyTimers = [];
+    }
+
     _sendText(text) {
         try {
             const proc = Gio.Subprocess.new(
@@ -90,10 +282,20 @@ export default class ClipboardLxExtension extends Extension {
     }
 
     disable() {
+        this._clearPendingPaste();
+        if (this._dbusImpl) {
+            this._dbusImpl.unexport();
+            this._dbusImpl = null;
+        }
+        if (this._busNameId) {
+            Gio.bus_unown_name(this._busNameId);
+            this._busNameId = 0;
+        }
         if (this._selection && this._ownerChangedId) {
             this._selection.disconnect(this._ownerChangedId);
             this._ownerChangedId = null;
         }
+        this._virtualKeyboard = null;
         this._selection = null;
         this._clipCtl = null;
     }
